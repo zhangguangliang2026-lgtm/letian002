@@ -240,6 +240,30 @@ export default function App() {
     setActiveChapterId(newChapter.id);
   };
 
+  const handleAddCustomChapter = () => {
+    if (!activeProjectId) return;
+    const defaultName = `第 ${ (activeProject?.chapters.length || 0) + 1 } 章`;
+    const chapterName = prompt('请输入自定义章节名称：', defaultName);
+    if (!chapterName || !chapterName.trim()) return;
+    
+    const newChapter: Chapter = {
+      id: crypto.randomUUID(),
+      title: chapterName.trim(),
+      content: '',
+      output: '',
+      assets: [],
+      createdAt: Date.now(),
+    };
+    
+    setProjects(projects.map(p => {
+      if (p.id === activeProjectId) {
+        return { ...p, chapters: [...p.chapters, newChapter] };
+      }
+      return p;
+    }));
+    setActiveChapterId(newChapter.id);
+  };
+
   const updateChapter = (content: any, field: keyof Chapter, chapterId?: string) => {
     const targetChapterId = chapterId || activeChapterId;
     if (!activeProjectId || !targetChapterId) return;
@@ -378,57 +402,82 @@ export default function App() {
         }
       } else {
         // OpenAI compatible providers (DeepSeek, Kimi via proxy)
-        const response = await fetch(`${settings.baseUrl}/chat/completions`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${settings.apiKey}`
-          },
-          body: JSON.stringify({
-            model: settings.modelName,
-            messages: [
-              { role: 'system', content: systemInstruction },
-              { role: 'user', content: prompt }
-            ],
-            temperature: 0.7,
-            stream: true,
-          })
-        });
+        let messages: any[] = [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: prompt }
+        ];
+        let fullTextLength = 0;
+        const maxTotalWords = 20000;
+        let count = 0;
 
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          const errorMsg = errorData.error?.message || `API 错误 (状态码: ${response.status})`;
-          throw new Error(errorMsg);
-        }
+        while (fullTextLength < maxTotalWords) {
+          count++;
+          if (count > 20) break; // 最多循环20次作为安全保护
 
-        if (!response.body) throw new Error('No response body');
+          const response = await fetch(`${settings.baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${settings.apiKey}`
+            },
+            body: JSON.stringify({
+              model: settings.modelName,
+              messages: messages,
+              temperature: 0.7,
+              stream: true,
+            })
+          });
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder('utf-8');
-        let done = false;
+          if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            const errorMsg = errorData.error?.message || `API 错误 (状态码: ${response.status})`;
+            throw new Error(errorMsg);
+          }
 
-        while (!done) {
-          const { value, done: readerDone } = await reader.read();
-          done = readerDone;
-          if (value) {
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split('\n').filter(line => line.trim() !== '');
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const dataStr = line.replace('data: ', '');
-                if (dataStr === '[DONE]') continue;
-                try {
-                  const data = JSON.parse(dataStr);
-                  const content = data.choices?.[0]?.delta?.content;
-                  if (content) {
-                    onChunk(content);
+          if (!response.body) throw new Error('No response body');
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder('utf-8');
+          let done = false;
+          let currentChunkText = '';
+          let finishReason = null;
+
+          while (!done) {
+            const { value, done: readerDone } = await reader.read();
+            done = readerDone;
+            if (value) {
+              const chunk = decoder.decode(value, { stream: true });
+              const lines = chunk.split('\n').filter(line => line.trim() !== '');
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  const dataStr = line.replace('data: ', '');
+                  if (dataStr === '[DONE]') continue;
+                  try {
+                    const data = JSON.parse(dataStr);
+                    const content = data.choices?.[0]?.delta?.content;
+                    if (content) {
+                      currentChunkText += content;
+                      fullTextLength += content.length;
+                      onChunk(content);
+                    }
+                    if (data.choices?.[0]?.finish_reason) {
+                      finishReason = data.choices[0].finish_reason;
+                    }
+                  } catch (e) {
+                    // Ignore parse errors for incomplete chunks
                   }
-                } catch (e) {
-                  // Ignore parse errors for incomplete chunks
                 }
               }
             }
           }
+
+          // 如果模型自然结束（stop），或者输出太短，说明已经完成，不需要再继续循环
+          if (finishReason === 'stop' || currentChunkText.length < 50) {
+            break;
+          }
+
+          messages.push({ role: 'assistant', content: currentChunkText });
+          messages.push({ role: 'user', content: '继续输出，不要重复，不要总结，直接接着写' });
         }
       }
     } catch (error: any) {
@@ -785,13 +834,22 @@ export default function App() {
               >
                 <div className="p-6 border-b border-black/5 flex items-center justify-between">
                   <h3 className="font-black text-lg">章节列表</h3>
-                  <button 
-                    onClick={handleAddChapter}
-                    className="p-2 bg-emerald-50 text-emerald-600 rounded-xl hover:bg-emerald-100 transition-colors"
-                    title="添加章节"
-                  >
-                    <PlusCircle size={20} />
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button 
+                      onClick={handleAddCustomChapter}
+                      className="p-2 bg-blue-50 text-blue-600 rounded-xl hover:bg-blue-100 transition-colors"
+                      title="自定义添加章节"
+                    >
+                      <Edit2 size={20} />
+                    </button>
+                    <button 
+                      onClick={handleAddChapter}
+                      className="p-2 bg-emerald-50 text-emerald-600 rounded-xl hover:bg-emerald-100 transition-colors"
+                      title="添加章节"
+                    >
+                      <PlusCircle size={20} />
+                    </button>
+                  </div>
                 </div>
                 <div className="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar">
                   {activeProject?.chapters.length === 0 ? (
