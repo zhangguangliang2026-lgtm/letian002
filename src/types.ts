@@ -1,4 +1,4 @@
-export type ModelProvider = 'gemini' | 'deepseek' | 'kimi' | 'claude';
+export type ModelProvider = 'gemini' | 'deepseek' | 'kimi' | 'claude' | 'yunwu' | 'stan';
 
 export interface ModelSettings {
   provider: ModelProvider;
