@@ -3,7 +3,7 @@ export const DEFAULT_ASSET_EXTRACTION_TEMPLATE = `
 你的任务是：分析提供的剧情原文和已生成的分镜提示词，提取出其中提到的核心场景、核心道具、核心角色。
 对于每一个提取出的资产，你需要根据以下规则生成一段非常细节完整的生图提示词（英文）：
 
-1. 风格锁死：必须完全符合当前剧本的风格：\${style}。如果是3D国漫仙侠，应包含 "3D render, C4D style, top-tier Chinese animation (Donghua) environment design" 等关键词。
+1. 风格锁死：必须完全符合当前剧本的风格：\${style}。请根据该风格的特点，自动补充最合适的画面质感、渲染引擎（如Unreal Engine 5, Octane Render等）、光影等英文关键词。
 2. 道具要求：
    - 白底 (white background)。
    - 只显示道具本身，不要其他元素。
@@ -36,7 +36,8 @@ export const DEFAULT_ASSET_EXTRACTION_TEMPLATE = `
 
 export const getAssetExtractionInstruction = (style: string, template?: string) => {
   const t = template || DEFAULT_ASSET_EXTRACTION_TEMPLATE;
-  return t.replace(/\${style}/g, style);
+  const instruction = t.replace(/\${style}/g, style);
+  return instruction + `\n\n【最高优先级指令】：\n当前剧本的全局核心风格已锁定为：【${style}】。\n如果上方指令模板中出现了与其他风格相关的举例、暗示或冲突（例如提到“国漫”、“仙侠”等），请一律无视！\n必须100%严格按照【${style}】来生成所有提示词，确保画面质感、人物特征、场景氛围完全契合【${style}】！`;
 };
 
 export const DEFAULT_STORYBOARD_TEMPLATE = `
@@ -120,5 +121,6 @@ export const DEFAULT_STORYBOARD_TEMPLATE = `
 
 export const getSystemInstruction = (style: string, template?: string) => {
   const t = template || DEFAULT_STORYBOARD_TEMPLATE;
-  return t.replace(/\${style}/g, style);
+  const instruction = t.replace(/\${style}/g, style);
+  return instruction + `\n\n【最高优先级指令】：\n当前剧本的全局核心风格已锁定为：【${style}】。\n如果上方指令模板中出现了与其他风格相关的举例、暗示或冲突（例如提到“国漫”、“仙侠”等），请一律无视！\n必须100%严格按照【${style}】来生成所有分镜提示词，确保画面质感、人物特征、场景氛围完全契合【${style}】！\n\n重要提示：当你完全完成所有内容的输出时，请务必在最后另起一行输出“[已完成]”三个字。如果没有输出这三个字，系统会认为你因为长度限制被截断了，从而强制你继续输出。`;
 };

@@ -29,7 +29,7 @@ import {
   Image as ImageIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Project, Chapter, STYLES, Asset, AppConfig, StyleOption } from './types';
+import { Project, Chapter, STYLES, Asset, AppConfig, StyleOption, InstructionCategory, InstructionTemplate } from './types';
 import { 
   getSystemInstruction, 
   getAssetExtractionInstruction,
@@ -89,8 +89,20 @@ export default function App() {
         deepseek: { provider: 'deepseek', modelName: 'deepseek-chat', apiKey: 'sk-356c3d66038a448e81fd74896493d26d', baseUrl: 'https://api.deepseek.com/v1' },
         kimi: { provider: 'kimi', modelName: 'moonshot-v1-8k', apiKey: 'sk-FCbTuS6XDJKi53ZrPfseP3SypA1a8hBnaY4V6YCOhEdfKfTv', baseUrl: 'https://api.moonshot.cn/v1' },
         claude: { provider: 'claude', modelName: 'claude-3-5-sonnet-20241022', apiKey: 'sk-wuCwGvtcQVo5o3wpAf6TMO5JJlrwVxKXkVUnckgJ14zd2FLU', baseUrl: 'https://api.bltcy.ai/v1' },
-        yunwu: { provider: 'yunwu', modelName: 'gpt-5-mini', apiKey: '', baseUrl: 'https://yunwu.ai/v1' },
-        stan: { provider: 'stan', modelName: 'claude-opus-4-6-a', apiKey: '', baseUrl: 'https://stan.ai678.top/v1' }
+        yijia: { provider: 'yijia', modelName: 'gpt-5.2', apiKey: '', baseUrl: 'https://api.yijiarj.cn/v1' },
+        wowcode: { provider: 'wowcode', modelName: 'claude-opus-4-6', apiKey: '', baseUrl: 'https://wowcode.cc/v1' }
+      },
+      templates: {
+        storyboard: [{ id: 'default', name: '默认分镜指令', content: DEFAULT_STORYBOARD_TEMPLATE }],
+        asset: [{ id: 'default', name: '默认资产提取指令', content: DEFAULT_ASSET_EXTRACTION_TEMPLATE }],
+        image: [{ id: 'default', name: '默认生图指令', content: '3D render, C4D style, high-quality character portrait, white background...' }],
+        video: [{ id: 'default', name: '默认视频指令', content: 'Cinematic video, 4k, high detail, smooth motion...' }]
+      },
+      activeTemplateIds: {
+        storyboard: 'default',
+        asset: 'default',
+        image: 'default',
+        video: 'default'
       }
     };
 
@@ -113,14 +125,46 @@ export default function App() {
         });
       }
 
+      // Migration for templates
+      const templates = parsed.templates || defaultConfig.templates;
+      const activeTemplateIds = parsed.activeTemplateIds || defaultConfig.activeTemplateIds;
+
+      // Seed templates if they are missing but legacy instructions exist
+      if (!parsed.templates) {
+        if (parsed.storyboardInstruction) {
+          templates.storyboard = [{ id: 'legacy', name: '已存分镜指令', content: parsed.storyboardInstruction }];
+          activeTemplateIds.storyboard = 'legacy';
+        }
+        if (parsed.assetExtractionInstruction) {
+          templates.asset = [{ id: 'legacy', name: '已存资产指令', content: parsed.assetExtractionInstruction }];
+          activeTemplateIds.asset = 'legacy';
+        }
+        if (parsed.imageGenInstruction) {
+          templates.image = [{ id: 'legacy', name: '已存生图指令', content: parsed.imageGenInstruction }];
+          activeTemplateIds.image = 'legacy';
+        }
+        if (parsed.videoGenInstruction) {
+          templates.video = [{ id: 'legacy', name: '已存视频指令', content: parsed.videoGenInstruction }];
+          activeTemplateIds.video = 'legacy';
+        }
+      }
+
       return {
         ...defaultConfig,
         ...parsed,
-        models: mergedModels
+        templates,
+        activeTemplateIds,
+        models: mergedModels,
+        selectedModel: ['gemini', 'deepseek', 'kimi', 'claude', 'yijia', 'wowcode'].includes(parsed.selectedModel) ? parsed.selectedModel : defaultConfig.selectedModel
       };
     }
     return defaultConfig;
   });
+
+  const [activeConfigCategory, setActiveConfigCategory] = useState<InstructionCategory>('storyboard');
+  const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
+  const [tempTemplateName, setTempTemplateName] = useState('');
+  const [deletingTemplateId, setDeletingTemplateId] = useState<string | null>(null);
 
   const [generatingChapterIds, setGeneratingChapterIds] = useState<string[]>([]);
   const [extractingChapterIds, setExtractingChapterIds] = useState<string[]>([]);
@@ -334,17 +378,25 @@ export default function App() {
           }
         }
       } else if (selectedModel === 'claude') {
-        let messages = [
+        let baseMessages = [
           { role: 'system', content: systemInstruction },
           { role: 'user', content: prompt }
         ];
         let fullTextLength = 0;
+        let fullText = '';
         const maxTotalWords = 80000;
         let count = 0;
 
         while (fullTextLength < maxTotalWords) {
           count++;
           if (count > 20) break; // 最多循环20次作为安全保护
+
+          const currentMessages = fullText ? [
+            ...baseMessages,
+            { role: 'assistant', content: fullText },
+            { role: 'user', content: '请无缝接着上面的最后一个字继续输出，不要任何开头语、过渡语或总结，直接输出后续内容。' }
+          ] : baseMessages;
+
           const response = await fetch(`${settings.baseUrl}/chat/completions`, {
             method: 'POST',
             headers: {
@@ -353,8 +405,9 @@ export default function App() {
             },
             body: JSON.stringify({
               model: settings.modelName,
-              messages: messages,
+              messages: currentMessages,
               temperature: 0.3,
+              max_tokens: 4096,
               stream: true,
             })
           });
@@ -364,6 +417,7 @@ export default function App() {
             const errorMsg = errorData.error?.message || `API 错误 (状态码: ${response.status})`;
             if (count > 1) {
               console.warn('API error on continuation, stopping stream:', errorMsg);
+              onChunk(`\n\n[API 续写请求失败: ${errorMsg}]`);
               break;
             }
             throw new Error(errorMsg);
@@ -375,6 +429,7 @@ export default function App() {
           const decoder = new TextDecoder('utf-8');
           let done = false;
           let currentChunkText = '';
+          let buffer = '';
 
           let finishReason = null;
 
@@ -382,17 +437,20 @@ export default function App() {
             const { value, done: readerDone } = await reader.read();
             done = readerDone;
             if (value) {
-              const chunk = decoder.decode(value, { stream: true });
-              const lines = chunk.split('\n').filter(line => line.trim() !== '');
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || '';
               for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                  const dataStr = line.replace('data: ', '');
+                const trimmedLine = line.trim();
+                if (trimmedLine.startsWith('data: ')) {
+                  const dataStr = trimmedLine.replace('data: ', '');
                   if (dataStr === '[DONE]') continue;
                   try {
                     const data = JSON.parse(dataStr);
                     const content = data.choices?.[0]?.delta?.content;
                     if (content) {
                       currentChunkText += content;
+                      fullText += content;
                       fullTextLength += content.length;
                       onChunk(content);
                     }
@@ -409,35 +467,50 @@ export default function App() {
 
           // 修复中转接口错误返回 stop 的问题：如果未以句号等结尾，视为未完成
           let isStopped = finishReason === 'stop';
-          if (isStopped && fullTextLength >= 1000 && !/[。！？.!?”’}\]>\`]$/.test(currentChunkText.trim())) {
-            isStopped = false;
+          
+          if (isStopped) {
+            const trimmedFull = fullText.trim();
+            const codeBlockMatches = trimmedFull.match(/```/g);
+            if (codeBlockMatches && codeBlockMatches.length % 2 !== 0) {
+              isStopped = false; // 代码块未闭合
+            } else if ((trimmedFull.startsWith('{') || trimmedFull.startsWith('[')) && !trimmedFull.endsWith('}') && !trimmedFull.endsWith(']')) {
+              isStopped = false; // JSON 未闭合
+            } else if (systemInstruction.includes('[已完成]') && !trimmedFull.includes('[已完成]')) {
+              isStopped = false; // 剧情未输出完毕标志
+            } else if (!/[。！？.!?”’"\'}\]>\`]$/.test(currentChunkText.trim())) {
+              isStopped = false; // 普通文本未以标点结尾
+            }
           }
           
-          if ((isStopped && finishReason !== 'length' && finishReason !== 'max_tokens') || (currentChunkText.length < 50 && /[。！？.!?”’}\]>\`]$/.test(currentChunkText.trim()))) {
+          if ((isStopped && finishReason !== 'length' && finishReason !== 'max_tokens') || (currentChunkText.length < 50 && /[。！？.!?”’"\'}\]>\`]$/.test(currentChunkText.trim()))) {
             break;
           }
 
           if (!currentChunkText.trim()) {
             break;
           }
-
-          messages.push({ role: 'assistant', content: currentChunkText });
-          messages.push({ role: 'user', content: '继续输出，不要重复，不要总结，直接接着写' });
         }
       } else {
         // OpenAI compatible providers (DeepSeek, Kimi via proxy)
-        let messages: any[] = [
+        let baseMessages: any[] = [
           { role: 'system', content: systemInstruction },
           { role: 'user', content: prompt }
         ];
         let fullTextLength = 0;
-        const maxTotalWords = 20000;
+        let fullText = '';
+        const maxTotalWords = 80000;
         let count = 0;
 
         while (fullTextLength < maxTotalWords) {
           count++;
           if (count > 20) break; // 最多循环20次作为安全保护
 
+          const currentMessages = fullText ? [
+            ...baseMessages,
+            { role: 'assistant', content: fullText },
+            { role: 'user', content: '请无缝接着上面的最后一个字继续输出，不要任何开头语、过渡语或总结，直接输出后续内容。' }
+          ] : baseMessages;
+
           const response = await fetch(`${settings.baseUrl}/chat/completions`, {
             method: 'POST',
             headers: {
@@ -446,14 +519,10 @@ export default function App() {
             },
             body: JSON.stringify({
               model: settings.modelName,
-              messages: messages,
+              messages: currentMessages,
               temperature: 0.7,
+              max_tokens: 4096,
               stream: true,
-              ...(settings.provider === 'yunwu' ? {
-                tools: [],
-                tool_choice: { type: "none" },
-                extra_body: { enable_thinking: true }
-              } : {})
             })
           });
 
@@ -462,6 +531,7 @@ export default function App() {
             const errorMsg = errorData.error?.message || `API 错误 (状态码: ${response.status})`;
             if (count > 1) {
               console.warn('API error on continuation, stopping stream:', errorMsg);
+              onChunk(`\n\n[API 续写请求失败: ${errorMsg}]`);
               break;
             }
             throw new Error(errorMsg);
@@ -473,23 +543,27 @@ export default function App() {
           const decoder = new TextDecoder('utf-8');
           let done = false;
           let currentChunkText = '';
+          let buffer = '';
           let finishReason = null;
 
           while (!done) {
             const { value, done: readerDone } = await reader.read();
             done = readerDone;
             if (value) {
-              const chunk = decoder.decode(value, { stream: true });
-              const lines = chunk.split('\n').filter(line => line.trim() !== '');
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || '';
               for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                  const dataStr = line.replace('data: ', '');
+                const trimmedLine = line.trim();
+                if (trimmedLine.startsWith('data: ')) {
+                  const dataStr = trimmedLine.replace('data: ', '');
                   if (dataStr === '[DONE]') continue;
                   try {
                     const data = JSON.parse(dataStr);
                     const content = data.choices?.[0]?.delta?.content;
                     if (content) {
                       currentChunkText += content;
+                      fullText += content;
                       fullTextLength += content.length;
                       onChunk(content);
                     }
@@ -506,20 +580,28 @@ export default function App() {
 
           // 修复中转接口错误返回 stop 的问题：如果未以句号等结尾，视为未完成
           let isStopped = finishReason === 'stop';
-          if (isStopped && fullTextLength >= 1000 && !/[。！？.!?”’}\]>\`]$/.test(currentChunkText.trim())) {
-            isStopped = false;
+          
+          if (isStopped) {
+            const trimmedFull = fullText.trim();
+            const codeBlockMatches = trimmedFull.match(/```/g);
+            if (codeBlockMatches && codeBlockMatches.length % 2 !== 0) {
+              isStopped = false; // 代码块未闭合
+            } else if ((trimmedFull.startsWith('{') || trimmedFull.startsWith('[')) && !trimmedFull.endsWith('}') && !trimmedFull.endsWith(']')) {
+              isStopped = false; // JSON 未闭合
+            } else if (systemInstruction.includes('[已完成]') && !trimmedFull.includes('[已完成]')) {
+              isStopped = false; // 剧情未输出完毕标志
+            } else if (!/[。！？.!?”’"\'}\]>\`]$/.test(currentChunkText.trim())) {
+              isStopped = false; // 普通文本未以标点结尾
+            }
           }
           
-          if ((isStopped && finishReason !== 'length' && finishReason !== 'max_tokens') || (currentChunkText.length < 50 && /[。！？.!?”’}\]>\`]$/.test(currentChunkText.trim()))) {
+          if ((isStopped && finishReason !== 'length' && finishReason !== 'max_tokens') || (currentChunkText.length < 50 && /[。！？.!?”’"\'}\]>\`]$/.test(currentChunkText.trim()))) {
             break;
           }
 
           if (!currentChunkText.trim()) {
             break;
           }
-
-          messages.push({ role: 'assistant', content: currentChunkText });
-          messages.push({ role: 'user', content: '继续输出，不要重复，不要总结，直接接着写' });
         }
       }
     } catch (error: any) {
@@ -532,7 +614,7 @@ export default function App() {
       } else if (error.message?.includes('API_KEY_INVALID')) {
         friendlyMessage = 'API Key 无效，请在配置面板中检查您的密钥设置。';
       } else if (error.message?.includes('当前分组上游负载已饱和')) {
-        friendlyMessage = '当前使用的 AI 接口（如 Yunwu）服务器负载过高，请求排队人数太多。请稍等几分钟后再试，或者在配置中切换到其他模型。';
+        friendlyMessage = '当前使用的 AI 接口服务器负载过高，请求排队人数太多。请稍等几分钟后再试，或者在配置中切换到其他模型。';
       }
       
       throw new Error(friendlyMessage);
@@ -551,9 +633,10 @@ export default function App() {
     
     try {
       let accumulatedText = '';
+      const activeTemplate = config.templates.storyboard.find(t => t.id === config.activeTemplateIds.storyboard)?.content || config.storyboardInstruction;
       await callAIStream(
         targetChapter.content,
-        getSystemInstruction(activeProject.style, config.storyboardInstruction),
+        getSystemInstruction(activeProject.style, activeTemplate),
         (chunk) => {
           accumulatedText += chunk;
           updateChapter(accumulatedText, 'output', targetChapterId);
@@ -577,9 +660,10 @@ export default function App() {
     setExtractingChapterIds(prev => [...prev, targetChapterId]);
     try {
       let result = '';
+      const activeTemplate = config.templates.asset.find(t => t.id === config.activeTemplateIds.asset)?.content || config.assetExtractionInstruction;
       await callAIStream(
         `剧情原文：\n${targetChapter.content}\n\n已生成的分镜提示词：\n${targetChapter.output}`,
-        getAssetExtractionInstruction(activeProject.style, config.assetExtractionInstruction),
+        getAssetExtractionInstruction(activeProject.style, activeTemplate),
         (chunk) => {
           result += chunk;
         }
@@ -678,9 +762,10 @@ export default function App() {
       const typeLabel = newAssetType === 'character' ? '角色' : newAssetType === 'prop' ? '道具' : '场景';
       const prompt = `剧情原文：\n${targetChapter.content}\n\n已生成的分镜提示词：\n${targetChapter.output}\n\n特别注意：本次只需要提取指定的资产：类型为【${typeLabel}】，名称为【${newAssetName.trim()}】。请只输出这一个资产的 JSON 对象。`;
       
+      const activeTemplate = config.templates.asset.find(t => t.id === config.activeTemplateIds.asset)?.content || config.assetExtractionInstruction;
       await callAIStream(
         prompt,
-        getAssetExtractionInstruction(activeProject.style, config.assetExtractionInstruction),
+        getAssetExtractionInstruction(activeProject.style, activeTemplate),
         (chunk) => {
           result += chunk;
         }
@@ -794,13 +879,21 @@ export default function App() {
       
       assets.forEach(asset => {
         if (!asset.name) return;
-        const index = segment.indexOf(asset.name);
-        if (index !== -1) {
+        let startIndex = 0;
+        while (true) {
+          const index = segment.indexOf(asset.name, startIndex);
+          if (index === -1) break;
           matches.push({ name: asset.name, index, length: asset.name.length });
+          startIndex = index + asset.name.length;
         }
       });
 
-      matches.sort((a, b) => a.index - b.index);
+      matches.sort((a, b) => {
+        if (a.index !== b.index) {
+          return a.index - b.index;
+        }
+        return b.length - a.length;
+      });
       
       let validMatches: typeof matches = [];
       let lastEnd = 0;
@@ -839,10 +932,10 @@ export default function App() {
   };
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-[#F8F9FA] text-[#2D3748] font-sans selection:bg-violet-200 selection:text-violet-900 flex flex-col">
+    <div className="min-h-screen bg-transparent text-[#1a1a1a] font-sans selection:bg-fuchsia-200 selection:text-fuchsia-900">
       {/* Header */}
-      <header className="h-14 bg-white border-b border-violet-100 flex-shrink-0 z-40 shadow-sm">
-        <div className="w-full h-full px-4 flex items-center justify-between">
+      <header className="bg-white/80 backdrop-blur-md border-b border-violet-100 sticky top-0 z-40">
+        <div className="max-w-[1600px] mx-auto px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 bg-violet-600 rounded-lg flex items-center justify-center text-white shadow-lg shadow-violet-600/20">
               <Sparkles size={20} />
@@ -905,7 +998,7 @@ export default function App() {
         <span className="text-[10px] font-black text-slate-500 group-hover:text-slate-800">配置面板</span>
       </button>
 
-      <main className="flex-1 overflow-hidden relative">
+      <main className="max-w-[1600px] mx-auto p-6">
         <AnimatePresence mode="wait">
           {!activeProjectId ? (
             <motion.div 
@@ -913,7 +1006,7 @@ export default function App() {
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -20 }}
-              className="h-full overflow-y-auto p-8 space-y-8 custom-scrollbar"
+              className="space-y-8"
             >
               <div className="flex items-center justify-between">
                 <div>
@@ -922,7 +1015,7 @@ export default function App() {
                 </div>
                 <button 
                   onClick={() => setShowNewProjectModal(true)}
-                  className="bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white border-none px-6 py-3 rounded-full flex items-center gap-2 hover:opacity-90 hover:shadow-lg hover:shadow-violet-500/30 hover:-translate-y-0.5 transition-all shadow-xl shadow-violet-500/20 active:scale-95 font-black"
+                  className="bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white border-none px-6 py-3 rounded-3xl flex items-center gap-2 hover:opacity-90 hover:shadow-lg hover:shadow-violet-500/30 hover:-translate-y-0.5 transition-all shadow-xl shadow-violet-500/20 active:scale-95 font-black"
                 >
                   <Plus size={20} />
                   新建剧本
@@ -930,7 +1023,7 @@ export default function App() {
               </div>
 
               {projects.length === 0 ? (
-                <div className="bg-white/80 backdrop-blur-sm border-2 border-dashed border-violet-100/50 rounded-3xl p-24 flex flex-col items-center justify-center text-center shadow-sm">
+                <div className="bg-white/80 backdrop-blur-sm border-2 border-dashed border-violet-100/50 rounded-[40px] p-24 flex flex-col items-center justify-center text-center shadow-sm">
                   <div className="w-20 h-20 bg-gradient-to-br from-violet-50 to-fuchsia-50 rounded-full flex items-center justify-center text-violet-400 mb-6 shadow-inner">
                     <BookOpen size={40} />
                   </div>
@@ -946,7 +1039,7 @@ export default function App() {
                       key={project.id}
                       layoutId={project.id}
                       onClick={() => setActiveProjectId(project.id)}
-                      className="bg-white border border-violet-100 rounded-3xl p-8 cursor-pointer hover:shadow-2xl hover:shadow-violet-500/20 transition-all duration-300 hover:-translate-y-1 group relative overflow-hidden flex flex-col h-full"
+                      className="bg-white border border-violet-100 rounded-[40px] p-8 cursor-pointer hover:shadow-2xl hover:shadow-violet-500/20 transition-all duration-300 hover:-translate-y-1 group relative overflow-hidden flex flex-col h-full"
                     >
                       <div className="absolute top-0 left-0 w-1.5 h-full bg-violet-500 opacity-0 group-hover:opacity-100 transition-opacity" />
                       <div className="flex justify-between items-start mb-6">
@@ -983,14 +1076,14 @@ export default function App() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="flex h-full w-full relative bg-[#F8F9FA]"
+              className="flex gap-6 h-[calc(100vh-140px)] relative"
             >
               {/* Sidebar: Chapters */}
               <motion.div 
-                animate={{ width: isSidebarOpen ? 280 : 0, opacity: isSidebarOpen ? 1 : 0 }}
-                className="bg-white border-r border-violet-100 flex flex-col h-full overflow-hidden shrink-0 shadow-[4px_0_24px_rgba(0,0,0,0.02)] z-10"
+                animate={{ width: isSidebarOpen ? 320 : 0, opacity: isSidebarOpen ? 1 : 0 }}
+                className="bg-white/90 backdrop-blur-xl border border-violet-100/50 rounded-[40px] flex flex-col shadow-xl shadow-violet-900/5 overflow-hidden"
               >
-                <div className="p-4 border-b border-violet-100 flex items-center justify-between bg-white">
+                <div className="p-6 border-b border-violet-100 flex items-center justify-between">
                   <h3 className="font-black text-lg">章节列表</h3>
                   <div className="flex items-center gap-2">
                     <button 
@@ -1074,17 +1167,16 @@ export default function App() {
               {/* Toggle Sidebar Button */}
               <button 
                 onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-                className="absolute top-1/2 -translate-y-1/2 z-20 w-5 h-10 bg-white border border-violet-100 border-l-0 rounded-r-lg flex items-center justify-center shadow-sm hover:bg-violet-50 transition-colors"
-                style={{ left: isSidebarOpen ? 280 : 0 }}
+                className="absolute left-[-12px] top-1/2 -translate-y-1/2 z-10 w-6 h-12 bg-white border border-violet-100 rounded-full flex items-center justify-center shadow-md hover:bg-slate-50/80 transition-colors"
               >
                 {isSidebarOpen ? <ChevronRight size={14} className="rotate-180" /> : <ChevronRight size={14} />}
               </button>
 
               {/* Main Content: Editor */}
-              <div className="flex-1 flex flex-col overflow-hidden p-4 gap-4">
+              <div className="flex-1 flex flex-col gap-6 overflow-hidden">
                 {!activeChapterId ? (
-                  <div className="flex-1 bg-white border border-violet-100 rounded-2xl flex flex-col items-center justify-center text-center p-12 shadow-sm">
-                    <div className="w-24 h-24 bg-violet-50 rounded-3xl flex items-center justify-center text-violet-600 mb-6">
+                  <div className="flex-1 bg-white border border-violet-100 rounded-[40px] flex flex-col items-center justify-center text-center p-12 shadow-sm">
+                    <div className="w-24 h-24 bg-violet-50 rounded-[40px] flex items-center justify-center text-violet-600 mb-6">
                       <BookOpen size={48} />
                     </div>
                     <h3 className="text-2xl font-black text-slate-800">请选择或创建一个章节</h3>
@@ -1093,17 +1185,17 @@ export default function App() {
                     </p>
                     <button 
                       onClick={handleAddChapter}
-                      className="mt-8 bg-violet-600 text-white px-8 py-3 rounded-full font-bold hover:bg-violet-700 transition-all shadow-lg shadow-violet-600/20 active:scale-95 flex items-center gap-2"
+                      className="mt-8 bg-violet-600 text-white px-8 py-3 rounded-3xl font-bold hover:bg-violet-700 transition-all shadow-lg shadow-violet-600/20 active:scale-95 flex items-center gap-2"
                     >
                       <PlusCircle size={20} />
                       新建章节
                     </button>
                   </div>
                 ) : (
-                  <div className="flex-1 flex gap-4 overflow-hidden">
+                  <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-6 overflow-hidden">
                     {/* Input Area */}
-                    <div className="flex-1 flex flex-col bg-white border border-violet-100 rounded-2xl shadow-sm overflow-hidden">
-                      <div className="flex items-center justify-between p-4 border-b border-violet-50 bg-white">
+                    <div className="flex flex-col bg-white border border-violet-100 rounded-[40px] p-8 shadow-sm overflow-hidden">
+                      <div className="flex items-center justify-between mb-6">
                         <div className="flex items-center gap-3">
                           <div className="p-2 bg-indigo-50 text-indigo-600 rounded-xl">
                             <FileText size={20} />
@@ -1142,14 +1234,14 @@ export default function App() {
                         value={activeChapter.content}
                         onChange={(e) => updateChapter(e.target.value, 'content')}
                         placeholder="在此粘贴章节内容或剧本草稿..."
-                        className="flex-1 w-full resize-none bg-slate-50/30 p-6 focus:outline-none focus:ring-0 border-none transition-all text-sm leading-relaxed font-medium custom-scrollbar"
+                        className="flex-1 w-full resize-none bg-slate-50/50 rounded-[40px] p-8 focus:outline-none focus:ring-4 focus:ring-violet-500/10 border border-violet-100/50 focus:border-violet-300 transition-all text-sm leading-relaxed font-medium shadow-inner"
                       />
-                      <div className="p-4 border-t border-violet-50 bg-white flex justify-end">
+                      <div className="mt-6 flex justify-end">
                         <button
                           onClick={() => handleGenerate()}
                           disabled={generatingChapterIds.includes(activeChapter.id) || !activeChapter.content.trim()}
                           className={`
-                            px-8 py-4 rounded-full font-black flex items-center gap-2 transition-all shadow-xl
+                            px-8 py-4 rounded-[24px] font-black flex items-center gap-2 transition-all shadow-xl
                             ${generatingChapterIds.includes(activeChapter.id) || !activeChapter.content.trim() 
                               ? 'bg-gray-100 text-slate-400 cursor-not-allowed' 
                               : 'bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:opacity-90 hover:shadow-lg hover:shadow-violet-500/30 hover:-translate-y-0.5 active:scale-95 shadow-violet-600/20 border-none'}
@@ -1171,8 +1263,8 @@ export default function App() {
                     </div>
 
                     {/* Output Area */}
-                    <div className="w-[45%] flex flex-col bg-white border border-violet-100 rounded-2xl shadow-sm overflow-hidden">
-                      <div className="flex items-center justify-between p-4 border-b border-violet-50 bg-white">
+                    <div className="flex flex-col bg-white border border-violet-100 rounded-[40px] p-8 shadow-sm overflow-hidden">
+                      <div className="flex items-center justify-between mb-6">
                         <div className="flex items-center gap-3">
                           <div className="p-2 bg-fuchsia-50 text-fuchsia-600 rounded-xl">
                             <History size={20} />
@@ -1201,7 +1293,7 @@ export default function App() {
                       </div>
 
                       {activeChapter.output && (
-                        <div className="flex items-center gap-2 px-4 py-3 border-b border-violet-50 bg-slate-50/50 overflow-x-auto custom-scrollbar">
+                        <div className="flex items-center gap-2 mb-4 overflow-x-auto custom-scrollbar pb-2">
                           {activeChapter.output.split(/(?=【片段)/).filter(s => s).map((segment, index) => {
                             const match = segment.match(/【片段\d+】/);
                             const title = match ? match[0] : `片段 ${index + 1}`;
@@ -1225,7 +1317,7 @@ export default function App() {
                         </div>
                       )}
 
-                      <div className="flex-1 bg-slate-900 p-6 overflow-y-auto font-mono text-sm text-slate-300 leading-relaxed custom-scrollbar shadow-inner">
+                      <div className="flex-1 bg-slate-900 rounded-[40px] p-8 overflow-y-auto font-mono text-sm text-slate-300 leading-relaxed custom-scrollbar border border-slate-800 shadow-inner">
                         {activeChapter.output ? (
                           <div className="whitespace-pre-wrap">
                             {renderHighlightedOutput(activeChapter.output, activeChapter.assets)}
@@ -1351,14 +1443,14 @@ export default function App() {
                     )}
 
                     {!extractingChapterIds.includes(activeChapter.id) && (activeChapter.assets?.length || 0) === 0 && (
-                      <div className="py-12 border-2 border-dashed border-gray-100 rounded-3xl flex flex-col items-center justify-center text-slate-400">
+                      <div className="py-12 border-2 border-dashed border-gray-100 rounded-[40px] flex flex-col items-center justify-center text-slate-400">
                         <p className="font-bold">点击上方按钮开始提取资产</p>
                       </div>
                     )}
 
                     <div className="grid grid-cols-1 gap-6">
                       {activeChapter.assets?.filter(asset => activeAssetTab === 'all' || asset.type === activeAssetTab).map((asset) => (
-                        <div key={asset.id} className="bg-gray-50 border border-violet-100 rounded-2xl p-6 hover:shadow-lg transition-all group">
+                        <div key={asset.id} className="bg-gray-50 border border-violet-100 rounded-[24px] p-6 hover:shadow-lg transition-all group">
                           <div className="flex items-center justify-between mb-4">
                             <div className="flex items-center gap-3">
                               <div className={`p-2 rounded-xl ${
@@ -1406,7 +1498,7 @@ export default function App() {
                       ))}
 
                       {activeChapter.assets?.length > 0 && activeChapter.assets?.filter(asset => activeAssetTab === 'all' || asset.type === activeAssetTab).length === 0 && (
-                        <div className="py-20 flex flex-col items-center justify-center text-slate-400 border-2 border-dashed border-gray-50 rounded-3xl">
+                        <div className="py-20 flex flex-col items-center justify-center text-slate-400 border-2 border-dashed border-gray-50 rounded-[40px]">
                           <Box size={40} className="mb-4 opacity-20" />
                           <p className="font-bold">该分类下暂无资产</p>
                         </div>
@@ -1435,9 +1527,9 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.9, y: 40 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 40 }}
-              className="bg-white/95 backdrop-blur-xl rounded-3xl p-10 w-full max-w-4xl max-h-[90vh] relative z-10 shadow-2xl flex flex-col overflow-hidden border border-white/20"
+              className="bg-white/95 backdrop-blur-xl rounded-[48px] p-8 w-full max-w-7xl h-[90vh] relative z-10 shadow-2xl flex flex-col overflow-hidden border border-white/20"
             >
-              <div className="flex items-center justify-between mb-8">
+              <div className="flex items-center justify-between mb-6">
                 <div className="flex items-center gap-3">
                   <div className="w-12 h-12 bg-gray-900 rounded-3xl flex items-center justify-center text-white">
                     <Sliders size={24} />
@@ -1447,78 +1539,242 @@ export default function App() {
                     <p className="text-sm text-slate-500 font-bold">自定义 AI 指令与生成规则</p>
                   </div>
                 </div>
-                <button 
-                  onClick={() => setShowConfigModal(false)}
-                  className="p-2 hover:bg-gray-100 rounded-xl transition-colors"
-                >
-                  <X size={24} />
-                </button>
+                <div className="flex items-center gap-4">
+                  <div className="flex items-center gap-2 text-green-600 bg-green-50 px-3 py-1.5 rounded-full text-[10px] font-black animate-pulse">
+                    <Check size={12} />
+                    已自动保存
+                  </div>
+                  <button 
+                    onClick={() => setShowConfigModal(false)}
+                    className="p-2 hover:bg-gray-100 rounded-xl transition-colors"
+                  >
+                    <X size={24} />
+                  </button>
+                </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto space-y-8 pr-4 custom-scrollbar">
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm font-black text-gray-700 flex items-center gap-2">
-                      <Sparkles size={16} className="text-violet-600" />
-                      1. 分镜提示词生成指令 (Storyboard Instruction)
-                    </label>
-                    <button 
-                      onClick={() => setConfig({...config, storyboardInstruction: DEFAULT_STORYBOARD_TEMPLATE})}
-                      className="text-[10px] font-black text-violet-600 hover:underline"
+              <div className="flex-1 overflow-hidden flex gap-8">
+                {/* Sidebar Navigation */}
+                <div className="w-64 flex flex-col gap-2 border-r border-violet-100 pr-6">
+                  {[
+                    { id: 'storyboard', name: '分镜提示词指令', icon: Sparkles, color: 'text-violet-600', bg: 'bg-violet-50' },
+                    { id: 'asset', name: '资产提取指令', icon: Library, color: 'text-blue-600', bg: 'bg-blue-50' },
+                    { id: 'image', name: '预留：生图指令', icon: Box, color: 'text-amber-600', bg: 'bg-amber-50' },
+                    { id: 'video', name: '预留：生视频指令', icon: RefreshCw, color: 'text-purple-600', bg: 'bg-purple-50' },
+                  ].map((cat) => (
+                    <button
+                      key={cat.id}
+                      onClick={() => setActiveConfigCategory(cat.id as InstructionCategory)}
+                      className={`
+                        flex items-center gap-3 px-4 py-3 rounded-2xl transition-all font-bold text-sm
+                        ${activeConfigCategory === cat.id 
+                          ? `${cat.bg} ${cat.color} shadow-sm ring-1 ring-inset ring-violet-200` 
+                          : 'text-slate-500 hover:bg-slate-50 hover:text-slate-700'}
+                      `}
                     >
-                      恢复默认
+                      <cat.icon size={18} />
+                      {cat.name}
                     </button>
-                  </div>
-                  <textarea
-                    value={config.storyboardInstruction}
-                    onChange={(e) => setConfig({...config, storyboardInstruction: e.target.value})}
-                    className="w-full h-48 bg-slate-50/80 border border-violet-100/50 rounded-2xl p-6 focus:outline-none focus:ring-4 focus:ring-violet-500/10 focus:border-violet-400 transition-all text-xs font-mono leading-relaxed shadow-inner"
-                  />
-                  <p className="text-[10px] text-slate-400 font-bold px-2">提示：使用 {"${style}"} 作为风格占位符</p>
+                  ))}
                 </div>
 
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm font-black text-gray-700 flex items-center gap-2">
-                      <Library size={16} className="text-blue-600" />
-                      2. 资产提取与提示词生成指令 (Asset Extraction Instruction)
-                    </label>
-                    <button 
-                      onClick={() => setConfig({...config, assetExtractionInstruction: DEFAULT_ASSET_EXTRACTION_TEMPLATE})}
-                      className="text-[10px] font-black text-blue-600 hover:underline"
+                {/* Content Area */}
+                <div className="flex-1 flex flex-col overflow-hidden">
+                  {/* Template Management */}
+                  <div className="mb-6 flex flex-wrap items-center gap-2">
+                    {config.templates[activeConfigCategory].map((template) => (
+                      <div key={template.id} className="relative group">
+                        {editingTemplateId === template.id ? (
+                          <div className="flex items-center gap-1 bg-white border-2 border-violet-500 rounded-xl px-2 py-1 shadow-md">
+                            <input
+                              autoFocus
+                              value={tempTemplateName}
+                              onChange={(e) => setTempTemplateName(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  const updatedTemplates = config.templates[activeConfigCategory].map(t => 
+                                    t.id === template.id ? { ...t, name: tempTemplateName.trim() || t.name } : t
+                                  );
+                                  setConfig({
+                                    ...config,
+                                    templates: { ...config.templates, [activeConfigCategory]: updatedTemplates }
+                                  });
+                                  setEditingTemplateId(null);
+                                } else if (e.key === 'Escape') {
+                                  setEditingTemplateId(null);
+                                }
+                              }}
+                              onBlur={() => {
+                                const updatedTemplates = config.templates[activeConfigCategory].map(t => 
+                                  t.id === template.id ? { ...t, name: tempTemplateName.trim() || t.name } : t
+                                );
+                                setConfig({
+                                  ...config,
+                                  templates: { ...config.templates, [activeConfigCategory]: updatedTemplates }
+                                });
+                                setEditingTemplateId(null);
+                              }}
+                              className="text-xs font-black text-slate-800 outline-none w-24"
+                            />
+                            <Check 
+                              size={14} 
+                              className="text-green-500 cursor-pointer" 
+                              onClick={() => {
+                                const updatedTemplates = config.templates[activeConfigCategory].map(t => 
+                                  t.id === template.id ? { ...t, name: tempTemplateName.trim() || t.name } : t
+                                );
+                                setConfig({
+                                  ...config,
+                                  templates: { ...config.templates, [activeConfigCategory]: updatedTemplates }
+                                });
+                                setEditingTemplateId(null);
+                              }}
+                            />
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => setConfig({
+                              ...config,
+                              activeTemplateIds: { ...config.activeTemplateIds, [activeConfigCategory]: template.id }
+                            })}
+                            className={`
+                              px-4 py-2 rounded-xl text-xs font-black transition-all border-2 flex items-center gap-2
+                              ${config.activeTemplateIds[activeConfigCategory] === template.id
+                                ? 'border-violet-500 bg-violet-500 text-white shadow-md'
+                                : 'border-slate-100 bg-slate-50 text-slate-500 hover:border-slate-200'}
+                            `}
+                          >
+                            {template.name}
+                            {config.activeTemplateIds[activeConfigCategory] === template.id && (
+                              <Edit2 
+                                size={12} 
+                                className="cursor-pointer hover:scale-110 transition-transform"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setEditingTemplateId(template.id);
+                                  setTempTemplateName(template.name);
+                                }}
+                              />
+                            )}
+                          </button>
+                        )}
+                        {config.templates[activeConfigCategory].length > 1 && editingTemplateId !== template.id && (
+                          <div className="absolute -top-1 -right-1 flex items-center">
+                            {deletingTemplateId === template.id ? (
+                              <div className="flex items-center gap-1 bg-red-500 rounded-full px-2 py-0.5 shadow-lg animate-in zoom-in-50 duration-200">
+                                <span className="text-[8px] font-black text-white whitespace-nowrap">确定删除?</span>
+                                <Check 
+                                  size={10} 
+                                  className="text-white cursor-pointer hover:scale-125" 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const updatedTemplates = config.templates[activeConfigCategory].filter(t => t.id !== template.id);
+                                    const newActiveId = config.activeTemplateIds[activeConfigCategory] === template.id 
+                                      ? updatedTemplates[0].id 
+                                      : config.activeTemplateIds[activeConfigCategory];
+                                    setConfig({
+                                      ...config,
+                                      templates: { ...config.templates, [activeConfigCategory]: updatedTemplates },
+                                      activeTemplateIds: { ...config.activeTemplateIds, [activeConfigCategory]: newActiveId }
+                                    });
+                                    setDeletingTemplateId(null);
+                                  }}
+                                />
+                                <X 
+                                  size={10} 
+                                  className="text-white cursor-pointer hover:scale-125" 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setDeletingTemplateId(null);
+                                  }}
+                                />
+                              </div>
+                            ) : (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setDeletingTemplateId(template.id);
+                                }}
+                                className="w-4 h-4 bg-red-500 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm hover:scale-110 active:scale-95"
+                                title="删除模板"
+                              >
+                                <X size={10} />
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    <button
+                      onClick={() => {
+                        const newTemplate: InstructionTemplate = {
+                          id: crypto.randomUUID(),
+                          name: `新模板 ${config.templates[activeConfigCategory].length + 1}`,
+                          content: config.templates[activeConfigCategory].find(t => t.id === config.activeTemplateIds[activeConfigCategory])?.content || ''
+                        };
+                        setConfig({
+                          ...config,
+                          templates: {
+                            ...config.templates,
+                            [activeConfigCategory]: [...config.templates[activeConfigCategory], newTemplate]
+                          },
+                          activeTemplateIds: {
+                            ...config.activeTemplateIds,
+                            [activeConfigCategory]: newTemplate.id
+                          }
+                        });
+                        // Automatically enter edit mode for the new template
+                        setEditingTemplateId(newTemplate.id);
+                        setTempTemplateName(newTemplate.name);
+                      }}
+                      className="w-8 h-8 rounded-xl bg-slate-100 text-slate-500 flex items-center justify-center hover:bg-slate-200 transition-colors"
+                      title="添加新模板"
                     >
-                      恢复默认
+                      <Plus size={16} />
                     </button>
                   </div>
-                  <textarea
-                    value={config.assetExtractionInstruction}
-                    onChange={(e) => setConfig({...config, assetExtractionInstruction: e.target.value})}
-                    className="w-full h-48 bg-slate-50/80 border border-violet-100/50 rounded-2xl p-6 focus:outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-400 transition-all text-xs font-mono leading-relaxed shadow-inner"
-                  />
-                </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  <div className="space-y-4">
-                    <label className="text-sm font-black text-gray-700 flex items-center gap-2">
-                      <Box size={16} className="text-amber-600" />
-                      3. 预留：生图指令 (Image Gen)
-                    </label>
+                  {/* Editor */}
+                  <div className="flex-1 flex flex-col gap-4 min-h-0">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-sm font-black text-slate-700 flex items-center gap-2">
+                        <Edit2 size={14} className="text-violet-500" />
+                        编辑指令内容
+                      </h4>
+                      <button 
+                        onClick={() => {
+                          const defaultContent = activeConfigCategory === 'storyboard' ? DEFAULT_STORYBOARD_TEMPLATE : 
+                                               activeConfigCategory === 'asset' ? DEFAULT_ASSET_EXTRACTION_TEMPLATE : '';
+                          const updatedTemplates = config.templates[activeConfigCategory].map(t => 
+                            t.id === config.activeTemplateIds[activeConfigCategory] ? { ...t, content: defaultContent } : t
+                          );
+                          setConfig({
+                            ...config,
+                            templates: { ...config.templates, [activeConfigCategory]: updatedTemplates }
+                          });
+                        }}
+                        className="text-[10px] font-black text-violet-600 hover:underline"
+                      >
+                        恢复默认
+                      </button>
+                    </div>
                     <textarea
-                      value={config.imageGenInstruction}
-                      onChange={(e) => setConfig({...config, imageGenInstruction: e.target.value})}
-                      className="w-full h-32 bg-slate-50/80 border border-violet-100/50 rounded-2xl p-6 focus:outline-none focus:ring-4 focus:ring-amber-500/10 focus:border-amber-400 transition-all text-xs font-mono leading-relaxed shadow-inner"
+                      value={config.templates[activeConfigCategory].find(t => t.id === config.activeTemplateIds[activeConfigCategory])?.content || ''}
+                      onChange={(e) => {
+                        const updatedTemplates = config.templates[activeConfigCategory].map(t => 
+                          t.id === config.activeTemplateIds[activeConfigCategory] ? { ...t, content: e.target.value } : t
+                        );
+                        setConfig({
+                          ...config,
+                          templates: { ...config.templates, [activeConfigCategory]: updatedTemplates }
+                        });
+                      }}
+                      className="flex-1 w-full bg-slate-50/80 border border-violet-100/50 rounded-[32px] p-8 focus:outline-none focus:ring-4 focus:ring-violet-500/10 focus:border-violet-400 transition-all text-sm font-mono leading-relaxed shadow-inner resize-none"
+                      placeholder="在此输入指令内容..."
                     />
-                  </div>
-                  <div className="space-y-4">
-                    <label className="text-sm font-black text-gray-700 flex items-center gap-2">
-                      <RefreshCw size={16} className="text-purple-600" />
-                      4. 预留：生视频指令 (Video Gen)
-                    </label>
-                    <textarea
-                      value={config.videoGenInstruction}
-                      onChange={(e) => setConfig({...config, videoGenInstruction: e.target.value})}
-                      className="w-full h-32 bg-slate-50/80 border border-violet-100/50 rounded-2xl p-6 focus:outline-none focus:ring-4 focus:ring-purple-500/10 focus:border-purple-400 transition-all text-xs font-mono leading-relaxed shadow-inner"
-                    />
+                    {activeConfigCategory === 'storyboard' && (
+                      <p className="text-[10px] text-slate-400 font-bold px-2">提示：使用 {"${style}"} 作为风格占位符</p>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1526,7 +1782,7 @@ export default function App() {
               <div className="mt-8 pt-8 border-t border-violet-100 flex justify-end items-center">
                 <button
                   onClick={() => setShowConfigModal(false)}
-                  className="bg-gradient-to-r from-slate-800 to-slate-900 text-white px-10 py-4 rounded-full font-black hover:opacity-90 transition-all shadow-xl shadow-slate-900/20 active:scale-95 flex items-center gap-2 hover:-translate-y-0.5 border-none"
+                  className="bg-gradient-to-r from-slate-800 to-slate-900 text-white px-10 py-4 rounded-[24px] font-black hover:opacity-90 transition-all shadow-xl shadow-slate-900/20 active:scale-95 flex items-center gap-2 hover:-translate-y-0.5 border-none"
                 >
                   <Save size={20} />
                   保存配置
@@ -1552,7 +1808,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.9, y: 40 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 40 }}
-              className="bg-white/95 backdrop-blur-xl rounded-3xl p-10 w-full max-w-6xl max-h-[90vh] relative z-10 shadow-2xl flex flex-col overflow-hidden border border-white/20"
+              className="bg-white/95 backdrop-blur-xl rounded-[48px] p-10 w-full max-w-6xl max-h-[90vh] relative z-10 shadow-2xl flex flex-col overflow-hidden border border-white/20"
             >
               <div className="flex items-center justify-between mb-8">
                 <div className="flex items-center gap-3">
@@ -1577,7 +1833,7 @@ export default function App() {
                 <div className="space-y-4">
                   <label className="text-sm font-black text-gray-700">当前使用模型 (Selected Model)</label>
                   <div className="grid grid-cols-2 gap-3">
-                    {(['gemini', 'deepseek', 'kimi', 'claude', 'yunwu', 'stan'] as const).map((provider) => (
+                    {(['gemini', 'deepseek', 'kimi', 'claude', 'yijia', 'wowcode'] as const).map((provider) => (
                       <button
                         key={provider}
                         onClick={() => setConfig({ ...config, selectedModel: provider })}
@@ -1588,10 +1844,10 @@ export default function App() {
                           {provider === 'deepseek' && <LayoutDashboard size={16} />}
                           {provider === 'kimi' && <RefreshCw size={16} />}
                           {provider === 'claude' && <User size={16} />}
-                          {provider === 'yunwu' && <Box size={16} />}
-                          {provider === 'stan' && <Sparkles size={16} />}
+                          {provider === 'yijia' && <Box size={16} />}
+                          {provider === 'wowcode' && <Sparkles size={16} />}
                         </div>
-                        <span className="font-bold capitalize">{provider === 'yunwu' ? 'GPT-5.4-Pro' : provider === 'stan' ? 'Claude Opus 4.6' : provider}</span>
+                        <span className="font-bold capitalize">{provider === 'yijia' ? 'GPT-5.2' : provider === 'wowcode' ? 'Claude Opus 4.6' : provider}</span>
                       </button>
                     ))}
                   </div>
@@ -1599,10 +1855,10 @@ export default function App() {
 
                 {/* Provider Settings */}
                 <div className="space-y-6">
-                  {(['gemini', 'deepseek', 'kimi', 'claude', 'yunwu', 'stan'] as const).map((provider) => (
+                  {(['gemini', 'deepseek', 'kimi', 'claude', 'yijia', 'wowcode'] as const).map((provider) => (
                     <div key={`settings-${provider}`} className={`p-6 rounded-3xl border transition-all ${config.selectedModel === provider ? 'border-violet-300 bg-violet-50/50 shadow-sm' : 'border-violet-100/50 bg-slate-50/50 hover:bg-slate-50/80'}`}>
                       <h4 className="font-black text-slate-800 mb-4 flex items-center gap-2">
-                        <span className="capitalize">{provider === 'yunwu' ? 'GPT-5.4-Pro (Yunwu)' : provider === 'stan' ? 'Claude Opus 4.6 (Stan)' : provider}</span> 配置
+                        <span className="capitalize">{provider === 'yijia' ? 'GPT-5.2 (Yijia)' : provider === 'wowcode' ? 'Claude Opus 4.6 (Wowcode)' : provider}</span> 配置
                       </h4>
                       <div className="space-y-4">
                         <div>
@@ -1662,7 +1918,7 @@ export default function App() {
               <div className="mt-8 pt-8 border-t border-violet-100 flex justify-end">
                 <button
                   onClick={() => setShowModelConfigModal(false)}
-                  className="bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white px-10 py-4 rounded-full font-black hover:opacity-90 transition-all shadow-xl shadow-violet-500/30 active:scale-95 flex items-center gap-2 hover:-translate-y-0.5 border-none"
+                  className="bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white px-10 py-4 rounded-[24px] font-black hover:opacity-90 transition-all shadow-xl shadow-violet-500/30 active:scale-95 flex items-center gap-2 hover:-translate-y-0.5 border-none"
                 >
                   <Check size={20} />
                   完成设置
@@ -1688,7 +1944,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.9, y: 40 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 40 }}
-              className="bg-white/95 backdrop-blur-xl rounded-3xl p-10 w-full max-w-2xl relative z-10 shadow-2xl overflow-hidden border border-white/20"
+              className="bg-white/95 backdrop-blur-xl rounded-[48px] p-10 w-full max-w-2xl relative z-10 shadow-2xl overflow-hidden border border-white/20"
             >
               <div className="absolute top-0 right-0 p-6">
                 <button onClick={() => setShowNewProjectModal(false)} className="p-2 text-slate-400 hover:text-black transition-colors">
@@ -1707,7 +1963,7 @@ export default function App() {
                     value={newProjectName}
                     onChange={(e) => setNewProjectName(e.target.value)}
                     placeholder="给你的新剧本起个响亮的名字..."
-                    className="w-full bg-slate-50/80 border border-violet-100/50 rounded-2xl px-6 py-4 focus:outline-none focus:ring-4 focus:ring-violet-500/10 focus:border-violet-400 transition-all text-lg font-bold shadow-inner"
+                    className="w-full bg-slate-50/80 border border-violet-100/50 rounded-[24px] px-6 py-4 focus:outline-none focus:ring-4 focus:ring-violet-500/10 focus:border-violet-400 transition-all text-lg font-bold shadow-inner"
                   />
                 </div>
 
@@ -1796,14 +2052,14 @@ export default function App() {
               <div className="flex gap-4 mt-10">
                 <button
                   onClick={() => setShowNewProjectModal(false)}
-                  className="flex-1 px-6 py-4 rounded-full font-black text-slate-500 hover:bg-gray-100 transition-all"
+                  className="flex-1 px-6 py-4 rounded-[24px] font-black text-slate-500 hover:bg-gray-100 transition-all"
                 >
                   取消
                 </button>
                 <button
                   onClick={handleCreateProject}
                   disabled={!newProjectName.trim()}
-                  className="flex-1 px-6 py-4 rounded-full font-black bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-xl shadow-violet-500/30 hover:-translate-y-0.5 border-none"
+                  className="flex-1 px-6 py-4 rounded-[24px] font-black bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-xl shadow-violet-500/30 hover:-translate-y-0.5 border-none"
                 >
                   创建剧本
                 </button>
@@ -1831,7 +2087,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.9, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 20 }}
-              className="bg-white/95 backdrop-blur-xl rounded-3xl p-8 w-full max-w-md relative z-10 shadow-2xl border border-white/20"
+              className="bg-white/95 backdrop-blur-xl rounded-[40px] p-8 w-full max-w-md relative z-10 shadow-2xl border border-white/20"
             >
               <h3 className="text-2xl font-black mb-6 text-slate-800">
                 {isAddingStyle ? '添加自定义风格' : '修改风格'}
@@ -1885,14 +2141,14 @@ export default function App() {
                     setIsAddingStyle(false);
                     setEditingStyle(null);
                   }}
-                  className="flex-1 px-4 py-3 rounded-full font-black text-slate-500 hover:bg-gray-100 transition-all"
+                  className="flex-1 px-4 py-3 rounded-3xl font-black text-slate-500 hover:bg-gray-100 transition-all"
                 >
                   取消
                 </button>
                 <button
                   onClick={handleSaveStyle}
                   disabled={!editStyleName.trim() || !editStyleImage.trim()}
-                  className="flex-1 px-4 py-3 rounded-full font-black bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:opacity-90 disabled:opacity-50 transition-all shadow-lg shadow-violet-500/20 hover:-translate-y-0.5 border-none"
+                  className="flex-1 px-4 py-3 rounded-3xl font-black bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:opacity-90 disabled:opacity-50 transition-all shadow-lg shadow-violet-500/20 hover:-translate-y-0.5 border-none"
                 >
                   保存
                 </button>
@@ -1913,7 +2169,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="bg-white/95 backdrop-blur-xl rounded-3xl p-8 w-full max-w-md relative z-10 shadow-2xl border border-white/20"
+              className="bg-white/95 backdrop-blur-xl rounded-[40px] p-8 w-full max-w-md relative z-10 shadow-2xl border border-white/20"
             >
               <div className="flex items-center justify-between mb-8">
                 <div className="flex items-center gap-3">
@@ -1971,14 +2227,14 @@ export default function App() {
               <div className="flex gap-3 mt-8">
                 <button
                   onClick={() => setShowAddAssetModal(false)}
-                  className="flex-1 px-4 py-3 rounded-full font-black text-slate-500 hover:bg-gray-100 transition-all"
+                  className="flex-1 px-4 py-3 rounded-3xl font-black text-slate-500 hover:bg-gray-100 transition-all"
                 >
                   取消
                 </button>
                 <button
                   onClick={handleExtractSingleAsset}
                   disabled={!newAssetName.trim() || isExtractingSingle}
-                  className="flex-1 px-4 py-3 rounded-full font-black bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:opacity-90 disabled:opacity-50 transition-all shadow-lg shadow-violet-500/20 hover:-translate-y-0.5 border-none flex items-center justify-center gap-2"
+                  className="flex-1 px-4 py-3 rounded-3xl font-black bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:opacity-90 disabled:opacity-50 transition-all shadow-lg shadow-violet-500/20 hover:-translate-y-0.5 border-none flex items-center justify-center gap-2"
                 >
                   {isExtractingSingle ? <Loader2 size={18} className="animate-spin" /> : <Check size={18} />}
                   {isExtractingSingle ? '提取中...' : '提取并保存'}
@@ -2000,7 +2256,7 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="bg-white/95 backdrop-blur-xl rounded-3xl p-8 w-full max-w-md relative z-10 shadow-2xl border border-white/20"
+              className="bg-white/95 backdrop-blur-xl rounded-[40px] p-8 w-full max-w-md relative z-10 shadow-2xl border border-white/20"
             >
               <div className="flex items-center justify-between mb-8">
                 <div className="flex items-center gap-3">
@@ -2033,14 +2289,14 @@ export default function App() {
               <div className="flex gap-3 mt-8">
                 <button
                   onClick={() => setShowRefineAssetModal(false)}
-                  className="flex-1 px-4 py-3 rounded-full font-black text-slate-500 hover:bg-gray-100 transition-all"
+                  className="flex-1 px-4 py-3 rounded-3xl font-black text-slate-500 hover:bg-gray-100 transition-all"
                 >
                   取消
                 </button>
                 <button
                   onClick={handleRefineAsset}
                   disabled={!refineInstruction.trim() || isRefining}
-                  className="flex-1 px-4 py-3 rounded-full font-black bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:opacity-90 disabled:opacity-50 transition-all shadow-lg shadow-violet-500/20 hover:-translate-y-0.5 border-none flex items-center justify-center gap-2"
+                  className="flex-1 px-4 py-3 rounded-3xl font-black bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:opacity-90 disabled:opacity-50 transition-all shadow-lg shadow-violet-500/20 hover:-translate-y-0.5 border-none flex items-center justify-center gap-2"
                 >
                   {isRefining ? <Loader2 size={18} className="animate-spin" /> : <Sparkles size={18} />}
                   {isRefining ? '修改中...' : '开始修改'}

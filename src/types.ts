@@ -1,4 +1,4 @@
-export type ModelProvider = 'gemini' | 'deepseek' | 'kimi' | 'claude' | 'yunwu' | 'stan';
+export type ModelProvider = 'gemini' | 'deepseek' | 'kimi' | 'claude' | 'yijia' | 'wowcode';
 
 export interface ModelSettings {
   provider: ModelProvider;
@@ -7,6 +7,14 @@ export interface ModelSettings {
   baseUrl?: string;
 }
 
+export interface InstructionTemplate {
+  id: string;
+  name: string;
+  content: string;
+}
+
+export type InstructionCategory = 'storyboard' | 'asset' | 'image' | 'video';
+
 export interface AppConfig {
   storyboardInstruction: string;
   assetExtractionInstruction: string;
@@ -14,6 +22,8 @@ export interface AppConfig {
   videoGenInstruction: string;
   selectedModel: ModelProvider;
   models: Record<ModelProvider, ModelSettings>;
+  templates: Record<InstructionCategory, InstructionTemplate[]>;
+  activeTemplateIds: Record<InstructionCategory, string>;
 }
 
 export interface Asset {
