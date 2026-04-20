@@ -30,6 +30,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Project, Chapter, STYLES, Asset, AppConfig, StyleOption, InstructionCategory, InstructionTemplate } from './types';
+import { generateImageDakka, generateImageYijia } from './lib/imageApi';
 import { 
   getSystemInstruction, 
   getAssetExtractionInstruction,
@@ -103,10 +104,19 @@ export default function App() {
         asset: 'default',
         image: 'default',
         video: 'default'
-      }
+      },
+      autoExtractAssets: false,
+      imageProvider: 'dakka',
+      imageDakkaApiKey: '',
+      imageYijiaApiKey: '',
+      imageDakkaModel: 'nano-banana-pro',
+      imageYijiaModel: 'nano_banana_pro',
+      imageAspectRatio: '16:9',
+      imageSize: '2K',
+      autoDownloadImages: false
     };
 
-    const saved = localStorage.getItem('script_config_v2');
+    const saved = localStorage.getItem('script_config_v3');
     if (saved) {
       const parsed = JSON.parse(saved);
       // Merge models carefully: if a saved key is empty, use the default one for testing
@@ -157,6 +167,33 @@ export default function App() {
         models: mergedModels,
         selectedModel: ['gemini', 'deepseek', 'kimi', 'claude', 'yijia', 'wowcode'].includes(parsed.selectedModel) ? parsed.selectedModel : defaultConfig.selectedModel
       };
+    } else {
+      // Try migrating API keys from older configs if they are present
+      const oldSaved = localStorage.getItem('script_config_v2');
+      if (oldSaved) {
+        const parsedV2 = JSON.parse(oldSaved);
+        const mergedModels = { ...defaultConfig.models };
+        if (parsedV2.models) {
+          Object.keys(parsedV2.models).forEach(key => {
+            const provider = key as keyof typeof mergedModels;
+            if (mergedModels[provider]) {
+              mergedModels[provider] = {
+                ...mergedModels[provider],
+                ...parsedV2.models[provider],
+                apiKey: parsedV2.models[provider].apiKey || mergedModels[provider].apiKey
+              };
+            }
+          });
+        }
+        return {
+          ...defaultConfig,
+          models: mergedModels,
+          selectedModel: ['gemini', 'deepseek', 'kimi', 'claude', 'yijia', 'wowcode'].includes(parsedV2.selectedModel) ? parsedV2.selectedModel : defaultConfig.selectedModel,
+          imageDakkaApiKey: parsedV2.imageDakkaApiKey || '',
+          imageYijiaApiKey: parsedV2.imageYijiaApiKey || '',
+          imageProvider: ['dakka', 'yijia'].includes(parsedV2.imageProvider) ? parsedV2.imageProvider : defaultConfig.imageProvider
+        };
+      }
     }
     return defaultConfig;
   });
@@ -170,10 +207,171 @@ export default function App() {
   const [extractingChapterIds, setExtractingChapterIds] = useState<string[]>([]);
   const [copied, setCopied] = useState(false);
   const [inputCopied, setInputCopied] = useState(false);
+  const [assetLibraryView, setAssetLibraryView] = useState<'chapter' | 'global'>('chapter');
+  const [isGeneratingImages, setIsGeneratingImages] = useState<Record<string, boolean>>({});
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isBatchMode, setIsBatchMode] = useState(false);
+  const [selectedChapterIds, setSelectedChapterIds] = useState<string[]>([]);
 
   const activeProject = projects.find(p => p.id === activeProjectId);
   const activeChapter = activeProject?.chapters.find(c => c.id === activeChapterId);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
+
+  const globalAssets = React.useMemo(() => {
+    if (!activeProject) return [];
+    const map = new globalThis.Map<string, Asset & { chapterIds: string[], appearances: string[] }>();
+    activeProject.chapters.forEach(ch => {
+      ch.assets?.forEach(asset => {
+        const key = `${asset.type}-${asset.name}`;
+        if (!map.has(key)) {
+          map.set(key, { ...asset, chapterIds: [ch.id], appearances: [ch.title] });
+        } else {
+          const existing = map.get(key)!;
+          if (!existing.chapterIds.includes(ch.id)) {
+            existing.chapterIds.push(ch.id);
+            existing.appearances.push(ch.title);
+          }
+          if (!existing.imageUrl && asset.imageUrl) {
+             existing.imageUrl = asset.imageUrl;
+             existing.imageStatus = asset.imageStatus;
+          }
+        }
+      });
+    });
+    return Array.from(map.values());
+  }, [activeProject]);
+
+  const handleImportDocument = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !activeProject) return;
+
+    try {
+      const text = await file.text();
+      const lines = text.split(/\r?\n/);
+      
+      // 究极正则，支持几乎所有形式：
+      // - Markdown标题层级：### EP1, ## 第一章
+      // - 特殊修饰符：**EP 02**, 【EP3】, [第4集]
+      // - 混合搭配：EP2《莲心渡厄》, Chapter 5: Title
+      const chapterRegex = /^\s*(?:#+\s*)?(?:\**\s*)?(?:[-=~_]{2,}\s*)?(?:[【\[（《<\(\-]\s*)?(?:(?:第\s*[零一二三四五六七八九十百千0-9]+\s*[章篇回折集节卷部分])|(?:(?:[Ee][Pp]|[Cc]hapter|[Vv]ol(?:ume)?|[Ee]pisode|章|篇|集|节|卷|Part|PART|Season|S)\s*[\.、：:\-]?\s*[0-9零一二三四五六七八九十百千]+))(?:[\]】）》>\)]?)?(?:[\s：:、\-]*)(.*)$/i;
+      
+      let currentChapterTitle = '';
+      let currentChapterContent: string[] = [];
+      const rawChapters: { title: string, content: string }[] = [];
+
+      for (const line of lines) {
+        const match = line.match(chapterRegex);
+        if (match) {
+          if (currentChapterTitle || currentChapterContent.some(l => l.trim())) {
+            rawChapters.push({ 
+              title: currentChapterTitle || '引言', 
+              content: currentChapterContent.join('\n').trim() 
+            });
+          }
+          currentChapterTitle = line.trim();
+          currentChapterContent = [];
+        } else {
+          currentChapterContent.push(line);
+        }
+      }
+      
+      if (currentChapterTitle || currentChapterContent.some(l => l.trim())) {
+        rawChapters.push({ 
+          title: currentChapterTitle || '序章', 
+          content: currentChapterContent.join('\n').trim() 
+        });
+      }
+
+      const extractedChapters: { title: string, content: string }[] = [];
+      const MAX_LENGTH = 5000;
+
+      rawChapters.forEach(ch => {
+        let content = ch.content;
+        if (content.length <= MAX_LENGTH) {
+          extractedChapters.push({ title: ch.title, content });
+        } else {
+          // 如果长度超过限制（5000字），强行将其进行多部分分割以免影响上下文性能和显示
+          let remaining = content;
+          let partIndex = 1;
+          while (remaining.length > MAX_LENGTH) {
+            let splitPoint = MAX_LENGTH;
+            const windowStr = remaining.substring(MAX_LENGTH - 1000, MAX_LENGTH);
+            
+            // 优先从段落（换行符）切割
+            const lastNewline = windowStr.lastIndexOf('\n');
+            if (lastNewline !== -1) {
+              splitPoint = MAX_LENGTH - 1000 + lastNewline + 1;
+            } else {
+              // 找不到换行则尝试标点符号
+              const maxPunc = Math.max(
+                windowStr.lastIndexOf('。'),
+                windowStr.lastIndexOf('！'),
+                windowStr.lastIndexOf('？'),
+                windowStr.lastIndexOf('”'),
+                windowStr.lastIndexOf('.')
+              );
+              if (maxPunc !== -1) {
+                splitPoint = MAX_LENGTH - 1000 + maxPunc + 1;
+              }
+            }
+            
+            extractedChapters.push({
+              title: `${ch.title} (部分 ${partIndex})`,
+              content: remaining.substring(0, splitPoint).trim()
+            });
+            remaining = remaining.substring(splitPoint).trimStart();
+            partIndex++;
+          }
+          if (remaining.length > 0) {
+            extractedChapters.push({
+              title: `${ch.title} (部分 ${partIndex})`,
+              content: remaining.trim()
+            });
+          }
+        }
+      });
+
+      if (extractedChapters.length === 0) {
+        alert("未能在文档中识别出明确的章节标记。");
+        return;
+      }
+
+      const newChapters: Chapter[] = extractedChapters.map((ch, index) => ({
+        id: crypto.randomUUID(),
+        title: ch.title,
+        content: ch.content,
+        output: '',
+        assets: [],
+        createdAt: Date.now() + index
+      }));
+
+      setProjects(projects.map(p => {
+        if (p.id === activeProjectId) {
+          return { ...p, chapters: [...p.chapters, ...newChapters] };
+        }
+        return p;
+      }));
+      
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    } catch (err) {
+      console.error(err);
+      alert("读取文件失败");
+    }
+  };
+
+  const handleBatchGenerate = async () => {
+    if (selectedChapterIds.length === 0) return;
+    
+    // Process concurrently
+    const promises = selectedChapterIds.map(id => handleGenerate(id));
+    
+    setIsBatchMode(false);
+    setSelectedChapterIds([]);
+    
+    await Promise.allSettled(promises);
+  };
 
   useEffect(() => {
     localStorage.setItem('script_projects_v2', JSON.stringify(projects));
@@ -204,19 +402,19 @@ export default function App() {
   }, [activeChapterId]);
 
   const handleSaveStyle = () => {
-    if (!editStyleName.trim() || !editStyleImage.trim()) return;
+    if (!editStyleName.trim()) return;
 
     if (isAddingStyle) {
       const newStyle: StyleOption = {
         id: `custom-${Date.now()}`,
         name: editStyleName,
-        image: editStyleImage,
+        image: editStyleImage || '',
       };
       setCustomStyles([...customStyles, newStyle]);
       setNewProjectStyle(newStyle.name);
     } else if (editingStyle) {
       setCustomStyles(customStyles.map(s => 
-        s.id === editingStyle.id ? { ...s, name: editStyleName, image: editStyleImage } : s
+        s.id === editingStyle.id ? { ...s, name: editStyleName, image: editStyleImage || '' } : s
       ));
       if (newProjectStyle === editingStyle.name) {
         setNewProjectStyle(editStyleName);
@@ -239,6 +437,9 @@ export default function App() {
       }
     }
   };
+
+  const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
 
   const handleCreateProject = () => {
     if (!newProjectName.trim()) return;
@@ -264,17 +465,20 @@ export default function App() {
     setActiveChapterId(newChapterId);
     setShowNewProjectModal(false);
     setNewProjectName('');
+    setIsBatchMode(false);
+    setSelectedChapterIds([]);
   };
 
-  const handleDeleteProject = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (confirm('确定要删除这个剧本吗？')) {
-      setProjects(projects.filter(p => p.id !== id));
-      if (activeProjectId === id) {
-        setActiveProjectId(null);
-        setActiveChapterId(null);
-      }
+  const handleConfirmDeleteProject = () => {
+    if (!projectToDelete || deleteConfirmText !== projectToDelete.name) return;
+    
+    setProjects(projects.filter(p => p.id !== projectToDelete.id));
+    if (activeProjectId === projectToDelete.id) {
+      setActiveProjectId(null);
+      setActiveChapterId(null);
     }
+    setProjectToDelete(null);
+    setDeleteConfirmText('');
   };
 
   const handleAddChapter = () => {
@@ -642,6 +846,11 @@ export default function App() {
           updateChapter(accumulatedText, 'output', targetChapterId);
         }
       );
+
+      if (config.autoExtractAssets) {
+        // Auto extract using the newly generated text to avoid stale state in closure
+        await handleExtractAssets(targetChapterId, accumulatedText);
+      }
     } catch (error) {
       console.error('Generation error:', error);
       updateChapter((prev: string) => prev + '\n\n发生错误: ' + (error instanceof Error ? error.message : String(error)), 'output', targetChapterId);
@@ -650,19 +859,20 @@ export default function App() {
     }
   };
 
-  const handleExtractAssets = async (chapterId?: string) => {
+  const handleExtractAssets = async (chapterId?: string, forceOutputText?: string) => {
     const targetChapterId = typeof chapterId === 'string' ? chapterId : activeChapterId;
     if (!activeProject || !targetChapterId) return;
     
     const targetChapter = activeProject.chapters.find(c => c.id === targetChapterId);
-    if (!targetChapter || !targetChapter.output) return;
+    const finalOutput = forceOutputText ?? targetChapter?.output;
+    if (!targetChapter || !finalOutput) return;
     
     setExtractingChapterIds(prev => [...prev, targetChapterId]);
     try {
       let result = '';
       const activeTemplate = config.templates.asset.find(t => t.id === config.activeTemplateIds.asset)?.content || config.assetExtractionInstruction;
       await callAIStream(
-        `剧情原文：\n${targetChapter.content}\n\n已生成的分镜提示词：\n${targetChapter.output}`,
+        `剧情原文：\n${targetChapter.content}\n\n已生成的分镜提示词：\n${finalOutput}`,
         getAssetExtractionInstruction(activeProject.style, activeTemplate),
         (chunk) => {
           result += chunk;
@@ -815,6 +1025,134 @@ export default function App() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const handleGenerateImage = async (assetType: 'character' | 'prop' | 'scene', assetName: string, promptInfo: string) => {
+    if (!activeProjectId) return;
+    const globalKey = `${assetType}-${assetName}`;
+    setIsGeneratingImages(prev => ({ ...prev, [globalKey]: true }));
+
+    setProjects(prevProjects => prevProjects.map(p => {
+      if (p.id !== activeProjectId) return p;
+      return {
+        ...p,
+        chapters: p.chapters.map(c => {
+          if (!c.assets) return c;
+          return {
+            ...c,
+            assets: c.assets.map(a => {
+              if (a.type === assetType && a.name === assetName) {
+                return { ...a, imageStatus: 'generating' as const };
+              }
+              return a;
+            })
+          };
+        })
+      };
+    }));
+
+    try {
+       const fullPrompt = promptInfo;
+       let url = '';
+       if (config.imageProvider === 'dakka') {
+         if (!config.imageDakkaApiKey) throw new Error("请先在配置中填写 Dakka API Key");
+         url = await generateImageDakka(
+           config.imageDakkaApiKey,
+           fullPrompt,
+           config.imageDakkaModel,
+           config.imageAspectRatio,
+           config.imageSize
+         );
+       } else {
+         if (!config.imageYijiaApiKey) throw new Error("请先在配置中填写 意佳 API Key");
+         url = await generateImageYijia(
+           config.imageYijiaApiKey,
+           fullPrompt,
+           config.imageYijiaModel,
+           config.imageAspectRatio
+         );
+       }
+
+       setProjects(prevProjects => prevProjects.map(p => {
+          if (p.id !== activeProjectId) return p;
+          return {
+            ...p,
+            chapters: p.chapters.map(c => {
+              if (!c.assets) return c;
+              return {
+                ...c,
+                assets: c.assets.map(a => {
+                  if (a.type === assetType && a.name === assetName) {
+                    return { ...a, imageStatus: 'success' as const, imageUrl: url };
+                  }
+                  return a;
+                })
+              };
+            })
+          };
+        }));
+        
+        if (config.autoDownloadImages) {
+          handleDownloadImage(url, assetType, assetName, 0);
+        }
+
+    } catch (err: any) {
+        alert("生图失败: " + err.message);
+        setProjects(prevProjects => prevProjects.map(p => {
+          if (p.id !== activeProjectId) return p;
+          return {
+            ...p,
+            chapters: p.chapters.map(c => {
+              if (!c.assets) return c;
+              return {
+                ...c,
+                assets: c.assets.map(a => {
+                  if (a.type === assetType && a.name === assetName) {
+                    return { ...a, imageStatus: 'error' as const };
+                  }
+                  return a;
+                })
+              };
+            })
+          };
+        }));
+    } finally {
+       setIsGeneratingImages(prev => ({ ...prev, [globalKey]: false }));
+    }
+  };
+
+  const handleBatchGenerateImages = async (type: 'character' | 'prop' | 'scene') => {
+    const assetsSource = assetLibraryView === 'global' ? globalAssets : (activeChapter?.assets || []);
+    const pendingAssets = assetsSource.filter(a => a.type === type && (!a.imageUrl || a.imageStatus === 'error') && !isGeneratingImages[`${a.type}-${a.name}`]);
+    for (const a of pendingAssets) {
+       handleGenerateImage(a.type, a.name, a.prompt);
+    }
+  };
+
+  const handleDownloadImage = async (url: string, prefix: string, assetName: string, num: number) => {
+    try {
+      const response = await fetch(url);
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      const typeChar = prefix === 'character' ? 'c' : prefix === 'prop' ? 'p' : 's';
+      let chId = 'global';
+      // we can try to guess first appearance
+      const matchAsset = globalAssets.find(ga => ga.type === prefix && ga.name === assetName);
+      if (matchAsset && matchAsset.appearances.length > 0) {
+         const t = matchAsset.appearances[0];
+         const matchInfo = t.match(/[0-9]+/);
+         if (matchInfo) chId = `ep${matchInfo[0]}`;
+      }
+      a.download = `${activeProject?.name || 'PROJECT'}_${chId}_${typeChar}${num}_${assetName}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(objectUrl);
+    } catch(err) {
+      alert("下载图像失败，这可能是跨域限制导致的。请右键图像保存。");
+    }
+  };
+
   const handleDownloadChapter = () => {
     if (!activeChapter) return;
 
@@ -940,7 +1278,16 @@ export default function App() {
             <div className="w-8 h-8 bg-violet-600 rounded-lg flex items-center justify-center text-white shadow-lg shadow-violet-600/20">
               <Sparkles size={20} />
             </div>
-            <h1 className="text-lg font-bold tracking-tight">Script Optimizer Pro</h1>
+            <h1 className="text-lg font-bold tracking-tight">
+              Script Optimizer Pro
+              {activeProject && <span className="ml-2 font-black text-slate-800 hidden sm:inline">- {activeProject.name}</span>}
+            </h1>
+            {activeProject && (
+              <div className="hidden md:flex items-center gap-2 px-3 py-1 bg-violet-50 rounded-lg border border-violet-100 ml-4">
+                <span className="text-xs text-slate-500 font-bold">风格</span>
+                <span className="text-xs text-violet-700 font-black">{activeProject.style}</span>
+              </div>
+            )}
           </div>
           
           <div className="flex items-center gap-4">
@@ -1038,7 +1385,11 @@ export default function App() {
                     <motion.div
                       key={project.id}
                       layoutId={project.id}
-                      onClick={() => setActiveProjectId(project.id)}
+                      onClick={() => {
+                        setActiveProjectId(project.id);
+                        setIsBatchMode(false);
+                        setSelectedChapterIds([]);
+                      }}
                       className="bg-white border border-violet-100 rounded-[40px] p-8 cursor-pointer hover:shadow-2xl hover:shadow-violet-500/20 transition-all duration-300 hover:-translate-y-1 group relative overflow-hidden flex flex-col h-full"
                     >
                       <div className="absolute top-0 left-0 w-1.5 h-full bg-violet-500 opacity-0 group-hover:opacity-100 transition-opacity" />
@@ -1047,7 +1398,11 @@ export default function App() {
                           <BookOpen size={24} />
                         </div>
                         <button 
-                          onClick={(e) => handleDeleteProject(project.id, e)}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setProjectToDelete(project);
+                            setDeleteConfirmText('');
+                          }}
                           className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all hover:scale-110"
                         >
                           <Trash2 size={20} />
@@ -1081,87 +1436,185 @@ export default function App() {
               {/* Sidebar: Chapters */}
               <motion.div 
                 animate={{ width: isSidebarOpen ? 320 : 0, opacity: isSidebarOpen ? 1 : 0 }}
-                className="bg-white/90 backdrop-blur-xl border border-violet-100/50 rounded-[40px] flex flex-col shadow-xl shadow-violet-900/5 overflow-hidden"
+                className="bg-white/90 backdrop-blur-xl border border-violet-100/50 rounded-[40px] flex flex-col shadow-xl shadow-violet-900/5 overflow-hidden relative"
               >
-                <div className="p-6 border-b border-violet-100 flex items-center justify-between">
-                  <h3 className="font-black text-lg">章节列表</h3>
-                  <div className="flex items-center gap-2">
-                    <button 
-                      onClick={handleAddChapter}
-                      className="p-2 bg-violet-100 text-violet-700 rounded-3xl hover:bg-violet-200 hover:scale-105 transition-colors"
-                      title="添加章节"
+                <div className="p-6 border-b border-violet-100 flex flex-col gap-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="font-black text-lg">章节列表</h3>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => {
+                          setIsBatchMode(!isBatchMode);
+                          setSelectedChapterIds([]);
+                        }}
+                        className={`p-2 rounded-3xl transition-colors ${isBatchMode ? 'bg-violet-600 text-white shadow-lg' : 'bg-violet-50 text-violet-600 hover:bg-violet-100'} `}
+                        title="批量操作"
+                      >
+                        <Library size={18} />
+                      </button>
+                      <button 
+                        onClick={() => fileInputRef.current?.click()}
+                        className="p-2 bg-indigo-50 text-indigo-600 rounded-3xl hover:bg-indigo-100 hover:scale-105 transition-colors"
+                        title="导入文档自动分章"
+                      >
+                        <Download size={18} className="rotate-180" />
+                      </button>
+                      <button 
+                        onClick={handleAddChapter}
+                        className="p-2 bg-violet-100 text-violet-700 rounded-3xl hover:bg-violet-200 hover:scale-105 transition-colors"
+                        title="添加章节"
+                      >
+                        <PlusCircle size={18} />
+                      </button>
+                      <input 
+                        type="file" 
+                        ref={fileInputRef} 
+                        onChange={handleImportDocument} 
+                        accept=".txt,.md" 
+                        className="hidden" 
+                      />
+                    </div>
+                  </div>
+                  {isBatchMode && (
+                    <div className="flex items-center justify-between text-xs font-bold text-slate-500">
+                      <button
+                        onClick={() => setSelectedChapterIds(
+                          selectedChapterIds.length === activeProject?.chapters.length 
+                            ? [] 
+                            : activeProject?.chapters.map(c => c.id) || []
+                        )}
+                        className="hover:text-violet-600 transition-colors flex items-center gap-1"
+                      >
+                        <div className={`w-4 h-4 rounded border flex items-center justify-center transition-colors ${selectedChapterIds.length === activeProject?.chapters.length && activeProject?.chapters.length > 0 ? 'bg-violet-600 border-violet-600 text-white' : 'border-slate-300'}`}>
+                          {selectedChapterIds.length === activeProject?.chapters.length && activeProject?.chapters.length > 0 && <Check size={10} />}
+                        </div>
+                        全选
+                      </button>
+                      <span className="text-violet-600 bg-violet-50 px-2 py-0.5 rounded-full">
+                        已选 {selectedChapterIds.length} 章
+                      </span>
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between bg-violet-50/50 p-2.5 rounded-xl border border-violet-100">
+                    <span className="text-xs font-bold text-violet-800">生成提示词后自动提取资产</span>
+                    <button
+                      onClick={() => setConfig({...config, autoExtractAssets: !config.autoExtractAssets})}
+                      className={`w-8 h-4 rounded-full transition-colors relative ${config.autoExtractAssets ? 'bg-violet-600' : 'bg-slate-300'}`}
                     >
-                      <PlusCircle size={20} />
+                      <div className={`w-3 h-3 bg-white rounded-full absolute top-[2px] transition-all ${config.autoExtractAssets ? 'left-[18px]' : 'left-[2px]'}`} />
                     </button>
                   </div>
                 </div>
-                <div className="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar">
+                <div className="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar pb-24">
                   {activeProject?.chapters.length === 0 ? (
                     <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-400">
-                      <p className="text-sm font-bold">暂无章节</p>
+                      <p className="text-sm font-bold border border-dashed border-slate-300 w-full p-4 rounded-xl">支持导入 .txt 文档自动分章</p>
                       <button 
-                        onClick={handleAddChapter}
-                        className="mt-4 text-xs font-black text-violet-600 hover:underline"
+                        onClick={() => fileInputRef.current?.click()}
+                        className="mt-4 text-xs font-black text-indigo-600 bg-indigo-50 px-4 py-2 rounded-xl hover:bg-indigo-100 transition-colors"
                       >
-                        立即添加
+                        立即导入
                       </button>
                     </div>
                   ) : (
                     activeProject?.chapters.map((chapter) => (
                       <div
                         key={chapter.id}
-                        onClick={() => setActiveChapterId(chapter.id)}
+                        onClick={() => {
+                          if (isBatchMode) {
+                            setSelectedChapterIds(prev => 
+                              prev.includes(chapter.id) ? prev.filter(id => id !== chapter.id) : [...prev, chapter.id]
+                            );
+                          } else {
+                            setActiveChapterId(chapter.id);
+                          }
+                        }}
                         className={`
                           group p-4 rounded-3xl cursor-pointer transition-all border
-                          ${activeChapterId === chapter.id 
+                          ${activeChapterId === chapter.id && !isBatchMode
                             ? 'bg-gradient-to-br from-violet-50 to-fuchsia-50 border-violet-200 shadow-md shadow-violet-500/10' 
+                            : isBatchMode && selectedChapterIds.includes(chapter.id)
+                            ? 'bg-violet-50/50 border-violet-300 shadow-sm'
                             : 'bg-white border-transparent hover:bg-slate-50/80'}
                         `}
                       >
                         <div className="flex justify-between items-start">
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                              {generatingChapterIds.includes(chapter.id) && (
-                                <Loader2 size={12} className="animate-spin text-violet-600" />
-                              )}
-                              <input
-                                type="text"
-                                value={chapter.title}
-                                onChange={(e) => updateChapter(e.target.value, 'title', chapter.id)}
-                                className={`text-sm font-bold truncate bg-transparent border-none focus:outline-none focus:ring-0 p-0 w-full ${activeChapterId === chapter.id ? 'text-violet-900' : 'text-slate-800'}`}
-                                title="点击修改章节名称"
-                              />
-                            </div>
-                            <p className="text-[10px] text-slate-400 mt-1 font-bold">
-                              {new Date(chapter.createdAt).toLocaleDateString()}
-                            </p>
-                          </div>
-                          <div className="flex items-center gap-1">
-                            {!generatingChapterIds.includes(chapter.id) && chapter.content.trim() && (
-                              <button 
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleGenerate(chapter.id);
-                                }}
-                                className="p-1.5 text-gray-300 hover:text-violet-600 opacity-0 group-hover:opacity-100 transition-opacity"
-                                title="生成提示词"
-                              >
-                                <Sparkles size={14} />
-                              </button>
+                          <div className="flex-1 min-w-0 flex items-start gap-3">
+                            {isBatchMode && (
+                              <div className={`mt-1 flex-shrink-0 w-4 h-4 rounded border flex items-center justify-center transition-colors ${selectedChapterIds.includes(chapter.id) ? 'bg-violet-600 border-violet-600 text-white' : 'border-slate-300'}`}>
+                                {selectedChapterIds.includes(chapter.id) && <Check size={10} />}
+                              </div>
                             )}
-                            <button 
-                              onClick={(e) => handleDeleteChapter(chapter.id, e)}
-                              className="p-1.5 text-gray-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"
-                              title="删除章节"
-                            >
-                              <Trash2 size={14} />
-                            </button>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2">
+                                {generatingChapterIds.includes(chapter.id) && (
+                                  <Loader2 size={12} className="animate-spin text-violet-600" />
+                                )}
+                                <input
+                                  type="text"
+                                  value={chapter.title}
+                                  onChange={(e) => updateChapter(e.target.value, 'title', chapter.id)}
+                                  onClick={(e) => { if (isBatchMode) e.preventDefault(); }}
+                                  readOnly={isBatchMode}
+                                  className={`text-sm font-bold truncate bg-transparent border-none focus:outline-none focus:ring-0 p-0 w-full ${activeChapterId === chapter.id && !isBatchMode ? 'text-violet-900' : 'text-slate-800'}`}
+                                  title={isBatchMode ? '' : "点击修改章节名称"}
+                                />
+                              </div>
+                              <p className="text-[10px] text-slate-400 mt-1 font-bold">
+                                {new Date(chapter.createdAt).toLocaleDateString()} · 约 {chapter.content.replace(/\s/g, '').length} 字
+                              </p>
+                            </div>
                           </div>
+                          {!isBatchMode && (
+                            <div className="flex items-center gap-1">
+                              {!generatingChapterIds.includes(chapter.id) && chapter.content.trim() && (
+                                <button 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleGenerate(chapter.id);
+                                  }}
+                                  className="p-1.5 text-gray-300 hover:text-violet-600 opacity-0 group-hover:opacity-100 transition-opacity"
+                                  title="生成提示词"
+                                >
+                                  <Sparkles size={14} />
+                                </button>
+                              )}
+                              <button 
+                                onClick={(e) => handleDeleteChapter(chapter.id, e)}
+                                className="p-1.5 text-gray-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                                title="删除章节"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
+                          )}
                         </div>
                       </div>
                     ))
                   )}
                 </div>
+
+                {isBatchMode && selectedChapterIds.length > 0 && (
+                  <div className="absolute bottom-0 left-0 right-0 p-4 bg-white/95 backdrop-blur-md border-t border-violet-100 shadow-[0_-10px_20px_-10px_rgba(0,0,0,0.1)]">
+                    <button
+                      onClick={handleBatchGenerate}
+                      disabled={selectedChapterIds.some(id => generatingChapterIds.includes(id))}
+                      className="w-full bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white font-black py-3 rounded-2xl flex items-center justify-center gap-2 hover:opacity-90 transition-opacity disabled:opacity-50"
+                    >
+                      {selectedChapterIds.some(id => generatingChapterIds.includes(id)) ? (
+                        <>
+                          <Loader2 size={16} className="animate-spin" />
+                          已有选中章节在生成...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles size={16} />
+                          并发生成选中的 {selectedChapterIds.length} 章
+                        </>
+                      )}
+                    </button>
+                  </div>
+                )}
               </motion.div>
 
               {/* Toggle Sidebar Button */}
@@ -1343,166 +1796,235 @@ export default function App() {
       {/* Asset Library Modal */}
       <AnimatePresence>
         {showAssetLibrary && (
-          <div className="fixed inset-0 z-50 flex items-center justify-end">
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               onClick={() => setShowAssetLibrary(false)}
-              className="absolute inset-0 bg-slate-900/40 backdrop-blur-md"
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-md"
             />
             <motion.div
-              initial={{ x: '100%' }}
-              animate={{ x: 0 }}
-              exit={{ x: '100%' }}
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
               transition={{ type: 'spring', damping: 25, stiffness: 200 }}
-              className="bg-white/95 backdrop-blur-xl w-full max-w-2xl h-full relative z-10 shadow-2xl flex flex-col border-l border-white/20"
+              className="bg-white/95 backdrop-blur-xl w-full max-w-5xl h-[90vh] relative z-10 shadow-2xl flex flex-col border border-white/20 rounded-[48px] overflow-hidden"
             >
               <div className="p-8 border-b border-violet-100/50 bg-white/50 flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 bg-violet-600 rounded-xl flex items-center justify-center text-white">
+                  <div className="w-12 h-12 bg-violet-600 rounded-2xl flex items-center justify-center text-white">
                     <Library size={24} />
                   </div>
                   <div>
                     <h3 className="text-xl font-black">资产库</h3>
-                    <p className="text-xs text-slate-500 font-bold">提取角色、道具与场景生图提示词</p>
+                    <p className="text-xs text-slate-500 font-bold">管理与生成项目资产图</p>
                   </div>
                 </div>
+                
+                <div className="flex items-center gap-2 bg-slate-100 p-1.5 rounded-full shadow-inner">
+                  <button
+                    onClick={() => setAssetLibraryView('chapter')}
+                    className={`px-6 py-2 rounded-full text-sm font-black transition-all ${assetLibraryView === 'chapter' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  >
+                    当前章节资产
+                  </button>
+                  <button
+                    onClick={() => setAssetLibraryView('global')}
+                    className={`px-6 py-2 rounded-full text-sm font-black transition-all ${assetLibraryView === 'global' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  >
+                    剧本总资产库
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-2 ml-4">
+                  <span className="text-sm font-bold text-slate-600">自动下载出图</span>
+                  <button
+                    onClick={() => setConfig({ ...config, autoDownloadImages: !config.autoDownloadImages })}
+                    className={`w-12 h-6 rounded-full relative transition-colors ${config.autoDownloadImages ? 'bg-violet-500' : 'bg-slate-300'}`}
+                  >
+                    <span className={`absolute top-1 bottom-1 left-1 bg-white w-4 rounded-full transition-transform ${config.autoDownloadImages ? 'translate-x-6' : 'translate-x-0'}`}></span>
+                  </button>
+                </div>
+
+                <div className="w-10"></div> {/* Spacer for alignment */}
                 <button 
                   onClick={() => setShowAssetLibrary(false)}
-                  className="p-2 hover:bg-gray-100 rounded-xl transition-colors"
+                  className="absolute right-8 top-8 p-2 hover:bg-gray-100 rounded-xl transition-colors"
                 >
                   <X size={24} />
                 </button>
               </div>
 
               <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
-                {!activeChapter?.output ? (
+                {(assetLibraryView === 'chapter' && !activeChapter?.output) ? (
                   <div className="h-full flex flex-col items-center justify-center text-center text-slate-400">
                     <Sparkles size={48} className="mb-4 opacity-20" />
-                    <p className="font-bold">请先生成分镜提示词，再提取资产。</p>
+                    <p className="font-bold">该章节请先生成分镜提示词，再提取资产。</p>
+                  </div>
+                ) : (assetLibraryView === 'global' && globalAssets.length === 0) ? (
+                   <div className="h-full flex flex-col items-center justify-center text-center text-slate-400">
+                    <Library size={48} className="mb-4 opacity-20" />
+                    <p className="font-bold">项目中暂无提取任何资产。</p>
                   </div>
                 ) : (
                   <div className="space-y-8">
                     <div className="flex flex-col gap-6">
                       <div className="flex items-center justify-between">
-                        <h4 className="font-black text-slate-800">资产管理</h4>
+                        <div className="flex items-center gap-2 bg-slate-100/80 p-1.5 rounded-2xl w-fit shadow-inner">
+                          {[
+                            { id: 'all', name: '全部', icon: <Library size={14} /> },
+                            { id: 'character', name: '角色资产', icon: <User size={14} /> },
+                            { id: 'prop', name: '道具资产', icon: <Box size={14} /> },
+                            { id: 'scene', name: '场景资产', icon: <Map size={14} /> }
+                          ].map((tab) => (
+                            <button
+                              key={tab.id}
+                              onClick={() => setActiveAssetTab(tab.id as any)}
+                              className={`
+                                flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-black transition-all
+                                ${activeAssetTab === tab.id 
+                                  ? 'bg-white text-violet-700 shadow-sm ring-1 ring-black/5' 
+                                  : 'text-slate-400 hover:text-gray-600'}
+                              `}
+                            >
+                              {tab.icon}
+                              {tab.name}
+                              <span className={`ml-1 text-[10px] opacity-50`}>
+                                ({tab.id === 'all' 
+                                  ? (assetLibraryView === 'global' ? globalAssets.length : activeChapter?.assets?.length || 0) 
+                                  : (assetLibraryView === 'global' ? globalAssets.filter(a => a.type === tab.id).length : activeChapter?.assets?.filter(a => a.type === tab.id).length || 0)})
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                        
                         <div className="flex items-center gap-3">
-                          <button
-                            onClick={() => setShowAddAssetModal(true)}
-                            className="flex items-center gap-2 text-xs font-black text-gray-600 hover:text-slate-800 bg-slate-100 px-4 py-2 rounded-full hover:bg-slate-200 transition-all active:scale-95"
-                          >
-                            <Plus size={14} />
-                            添加资产
-                          </button>
-                          <button
-                            onClick={() => handleExtractAssets()}
-                            disabled={extractingChapterIds.includes(activeChapter.id)}
-                            className="flex items-center gap-2 text-xs font-black text-violet-600 hover:text-violet-700 bg-violet-100 px-4 py-2 rounded-full hover:bg-violet-200 transition-all active:scale-95"
-                          >
-                            {extractingChapterIds.includes(activeChapter.id) ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-                            {activeChapter.assets?.length > 0 ? '重新提取' : '开始提取资产'}
-                          </button>
+                          {assetLibraryView === 'chapter' && (
+                            <>
+                              <button
+                                onClick={() => setShowAddAssetModal(true)}
+                                className="flex items-center gap-2 text-xs font-black text-gray-600 hover:text-slate-800 bg-slate-100 px-4 py-2 rounded-full hover:bg-slate-200 transition-all active:scale-95"
+                              >
+                                <Plus size={14} />
+                                添加资产
+                              </button>
+                              <button
+                                onClick={() => handleExtractAssets()}
+                                disabled={extractingChapterIds.includes(activeChapter!.id)}
+                                className="flex items-center gap-2 text-xs font-black text-violet-600 hover:text-violet-700 bg-violet-100 px-4 py-2 rounded-full hover:bg-violet-200 transition-all active:scale-95"
+                              >
+                                {extractingChapterIds.includes(activeChapter!.id) ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+                                {activeChapter!.assets?.length > 0 ? '重新提取' : '开始提取资产'}
+                              </button>
+                            </>
+                          )}
+                          {activeAssetTab !== 'all' && (
+                            <button
+                              onClick={() => handleBatchGenerateImages(activeAssetTab as any)}
+                              className="flex items-center gap-2 text-xs font-black text-amber-600 hover:text-amber-700 bg-amber-100 px-4 py-2 rounded-full hover:bg-amber-200 transition-all active:scale-95"
+                            >
+                              <ImageIcon size={14} />
+                              一键生成所有{activeAssetTab === 'character' ? '角色' : activeAssetTab === 'prop' ? '道具' : '场景'}
+                            </button>
+                          )}
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-2 bg-slate-100/80 p-1.5 rounded-2xl w-fit shadow-inner">
-                        {[
-                          { id: 'all', name: '全部', icon: <Library size={14} /> },
-                          { id: 'character', name: '角色资产', icon: <User size={14} /> },
-                          { id: 'prop', name: '道具资产', icon: <Box size={14} /> },
-                          { id: 'scene', name: '场景资产', icon: <Map size={14} /> }
-                        ].map((tab) => (
-                          <button
-                            key={tab.id}
-                            onClick={() => setActiveAssetTab(tab.id as any)}
-                            className={`
-                              flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-black transition-all
-                              ${activeAssetTab === tab.id 
-                                ? 'bg-white text-violet-700 shadow-sm ring-1 ring-black/5' 
-                                : 'text-slate-400 hover:text-gray-600'}
-                            `}
-                          >
-                            {tab.icon}
-                            {tab.name}
-                            <span className={`ml-1 text-[10px] opacity-50`}>
-                              ({tab.id === 'all' 
-                                ? activeChapter.assets?.length || 0 
-                                : activeChapter.assets?.filter(a => a.type === tab.id).length || 0})
-                            </span>
-                          </button>
-                        ))}
-                      </div>
                     </div>
 
-                    {extractingChapterIds.includes(activeChapter.id) && (
+                    {assetLibraryView === 'chapter' && extractingChapterIds.includes(activeChapter!.id) && (
                       <div className="py-12 flex flex-col items-center justify-center text-violet-600 gap-4">
                         <Loader2 size={40} className="animate-spin" />
                         <p className="font-black text-sm">正在分析剧情并生成生图提示词...</p>
                       </div>
                     )}
 
-                    {!extractingChapterIds.includes(activeChapter.id) && (activeChapter.assets?.length || 0) === 0 && (
-                      <div className="py-12 border-2 border-dashed border-gray-100 rounded-[40px] flex flex-col items-center justify-center text-slate-400">
-                        <p className="font-bold">点击上方按钮开始提取资产</p>
-                      </div>
-                    )}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      {(assetLibraryView === 'global' ? globalAssets : (activeChapter?.assets || [])).filter(asset => activeAssetTab === 'all' || asset.type === activeAssetTab).map((asset, assetIdx) => (
+                        <div key={asset.id || assetIdx} className="bg-gray-50 border border-violet-100 rounded-[32px] p-6 flex flex-col gap-4 hover:shadow-lg transition-all group relative overflow-hidden">
+                          
+                          <div className="flex items-start justify-between z-10 w-full gap-4">
+                             <div className="flex-1 min-w-0 flex flex-col">
+                                <div className="flex items-center gap-3 mb-2">
+                                  <div className={`p-2 rounded-xl flex-shrink-0 ${
+                                    asset.type === 'character' ? 'bg-blue-100 text-blue-600' :
+                                    asset.type === 'prop' ? 'bg-amber-100 text-amber-600' :
+                                    'bg-purple-100 text-purple-600'
+                                  }`}>
+                                    {asset.type === 'character' ? <User size={18} /> :
+                                     asset.type === 'prop' ? <Box size={18} /> :
+                                     <Map size={18} />}
+                                  </div>
+                                  <div className="min-w-0 flex-1">
+                                    <h5 className="font-black text-slate-800 text-lg truncate">{asset.name}</h5>
+                                    <span className="text-[10px] uppercase font-black tracking-wider text-slate-400">
+                                      {asset.type === 'character' ? '角色' : asset.type === 'prop' ? '道具' : '场景'}
+                                    </span>
+                                  </div>
+                                </div>
 
-                    <div className="grid grid-cols-1 gap-6">
-                      {activeChapter.assets?.filter(asset => activeAssetTab === 'all' || asset.type === activeAssetTab).map((asset) => (
-                        <div key={asset.id} className="bg-gray-50 border border-violet-100 rounded-[24px] p-6 hover:shadow-lg transition-all group">
-                          <div className="flex items-center justify-between mb-4">
-                            <div className="flex items-center gap-3">
-                              <div className={`p-2 rounded-xl ${
-                                asset.type === 'character' ? 'bg-blue-100 text-blue-600' :
-                                asset.type === 'prop' ? 'bg-amber-100 text-amber-600' :
-                                'bg-purple-100 text-purple-600'
-                              }`}>
-                                {asset.type === 'character' ? <User size={18} /> :
-                                 asset.type === 'prop' ? <Box size={18} /> :
-                                 <Map size={18} />}
-                              </div>
-                              <div>
-                                <h5 className="font-black text-slate-800">{asset.name}</h5>
-                                <span className="text-[10px] uppercase font-black tracking-wider text-slate-400">
-                                  {asset.type === 'character' ? '角色' : asset.type === 'prop' ? '道具' : '场景'}
-                                </span>
-                              </div>
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <button
-                                onClick={() => {
-                                  setRefiningAssetId(asset.id);
-                                  setRefineInstruction('');
-                                  setShowRefineAssetModal(true);
-                                }}
-                                className="p-2 text-slate-400 hover:text-blue-600 hover:bg-white rounded-lg transition-all flex items-center gap-1"
-                                title="AI 修改"
-                              >
-                                <Sparkles size={16} />
-                                <span className="text-xs font-bold">AI 修改</span>
-                              </button>
-                              <button
-                                onClick={() => copyToClipboard(asset.prompt)}
-                                className="p-2 text-slate-400 hover:text-violet-600 hover:bg-white rounded-lg transition-all"
-                                title="复制提示词"
-                              >
-                                <Copy size={16} />
-                              </button>
-                            </div>
+                                {assetLibraryView === 'global' && 'appearances' in asset && (
+                                  <div className="flex flex-wrap gap-1 mb-3">
+                                    {(asset as any).appearances.map((ep: string, idx: number) => (
+                                      <span key={idx} className="px-2 py-0.5 bg-slate-200 text-slate-600 text-[9px] rounded-full font-bold">{ep}</span>
+                                    ))}
+                                  </div>
+                                )}
+                                
+                                <div className="bg-white border border-violet-100 rounded-xl p-3 text-xs font-mono text-gray-500 leading-relaxed max-h-32 overflow-y-auto custom-scrollbar flex-1 relative">
+                                  {asset.prompt}
+                                  <div className="sticky top-0 right-0 flex justify-end">
+                                      <button onClick={() => copyToClipboard(asset.prompt)} className="p-1.5 bg-white/80 hover:bg-violet-100 rounded-md text-slate-400 hover:text-violet-600 transition-colors shadow-sm"><Copy size={12} /></button>
+                                  </div>
+                                </div>
+                             </div>
+
+                             {/* Right Side Image Box */}
+                             <div className="w-[180px] h-[180px] bg-slate-100 rounded-2xl flex-shrink-0 border-2 border-dashed border-slate-300 flex items-center justify-center relative overflow-hidden group/img">
+                               {isGeneratingImages[`${asset.type}-${asset.name}`] || asset.imageStatus === 'generating' ? (
+                                  <div className="flex flex-col items-center gap-2 text-violet-500">
+                                      <Loader2 size={32} className="animate-spin" />
+                                      <span className="text-[10px] font-bold">生图中</span>
+                                  </div>
+                               ) : asset.imageUrl ? (
+                                 <>
+                                  <img src={asset.imageUrl} alt={asset.name} className="w-full h-full object-cover" />
+                                  <div className="absolute inset-0 bg-black/50 opacity-0 group-hover/img:opacity-100 flex flex-col items-center justify-center gap-2 transition-opacity">
+                                      <button onClick={() => window.open(asset.imageUrl, '_blank')} className="px-4 py-1.5 bg-white/20 hover:bg-white/40 text-white rounded-full text-xs font-bold backdrop-blur-sm">查看大图</button>
+                                      <button onClick={() => handleDownloadImage(asset.imageUrl!, asset.type, asset.name, assetIdx)} className="px-4 py-1.5 bg-white text-slate-800 hover:bg-slate-100 rounded-full text-xs font-bold shadow-lg flex items-center gap-1"><Download size={14}/> 下载</button>
+                                      <button onClick={() => handleGenerateImage(asset.type as any, asset.name, asset.prompt)} className="px-4 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-full text-xs font-bold shadow-lg">重新生成</button>
+                                  </div>
+                                 </>
+                               ) : (
+                                  <button onClick={() => handleGenerateImage(asset.type as any, asset.name, asset.prompt)} className="flex flex-col items-center gap-2 text-slate-400 hover:text-violet-600 transition-colors hover:scale-110">
+                                      <ImageIcon size={32} />
+                                      <span className="text-[10px] font-bold">生成图片</span>
+                                  </button>
+                               )}
+                               {asset.imageStatus === 'error' && !isGeneratingImages[`${asset.type}-${asset.name}`] && (
+                                  <div className="absolute top-2 left-2 bg-red-500 text-white text-[9px] px-2 py-0.5 rounded-full font-bold shadow-sm">失败</div>
+                               )}
+                             </div>
                           </div>
-                          <div className="bg-white border border-violet-100 rounded-xl p-4 text-xs font-mono text-gray-600 leading-relaxed">
-                            {asset.prompt}
-                          </div>
+                          
+                          {assetLibraryView === 'chapter' && (
+                             <div className="flex justify-end gap-2 border-t border-slate-100 pt-3 mt-auto">
+                                <button
+                                  onClick={() => {
+                                    setRefiningAssetId(asset.id);
+                                    setRefineInstruction('');
+                                    setShowRefineAssetModal(true);
+                                  }}
+                                  className="px-3 py-1.5 text-slate-400 hover:text-blue-600 bg-slate-100 hover:bg-blue-50 rounded-lg transition-all flex items-center gap-1"
+                                >
+                                  <Sparkles size={12} />
+                                  <span className="text-[10px] font-bold">AI 修改提示词</span>
+                                </button>
+                             </div>
+                          )}
                         </div>
                       ))}
-
-                      {activeChapter.assets?.length > 0 && activeChapter.assets?.filter(asset => activeAssetTab === 'all' || asset.type === activeAssetTab).length === 0 && (
-                        <div className="py-20 flex flex-col items-center justify-center text-slate-400 border-2 border-dashed border-gray-50 rounded-[40px]">
-                          <Box size={40} className="mb-4 opacity-20" />
-                          <p className="font-bold">该分类下暂无资产</p>
-                        </div>
-                      )}
                     </div>
                   </div>
                 )}
@@ -1853,8 +2375,11 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Provider Settings */}
                 <div className="space-y-6">
+                  {/* TEXT MODELS */}
+                  <div className="mb-4">
+                    <h4 className="font-black text-slate-800 text-lg border-b pb-2">文本大模型配置</h4>
+                  </div>
                   {(['gemini', 'deepseek', 'kimi', 'claude', 'yijia', 'wowcode'] as const).map((provider) => (
                     <div key={`settings-${provider}`} className={`p-6 rounded-3xl border transition-all ${config.selectedModel === provider ? 'border-violet-300 bg-violet-50/50 shadow-sm' : 'border-violet-100/50 bg-slate-50/50 hover:bg-slate-50/80'}`}>
                       <h4 className="font-black text-slate-800 mb-4 flex items-center gap-2">
@@ -1912,6 +2437,111 @@ export default function App() {
                       </div>
                     </div>
                   ))}
+
+                  {/* IMAGE MODELS */}
+                  <div className="mt-12 mb-4">
+                    <h4 className="font-black text-slate-800 text-lg border-b pb-2">生图模型配置</h4>
+                  </div>
+                  
+                  <div className="space-y-4">
+                    <label className="text-sm font-black text-gray-700">默认生图提供商</label>
+                    <div className="flex gap-4">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="radio" checked={config.imageProvider === 'dakka'} onChange={() => setConfig({ ...config, imageProvider: 'dakka' })} className="text-violet-600 focus:ring-violet-500" />
+                        <span className="font-bold text-slate-700">Dakka Nano-Banana</span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="radio" checked={config.imageProvider === 'yijia'} onChange={() => setConfig({ ...config, imageProvider: 'yijia' })} className="text-violet-600 focus:ring-violet-500" />
+                        <span className="font-bold text-slate-700">Yijia (意佳)</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-[10px] font-black text-slate-500 mb-1 ml-1 uppercase">图片比例 (Aspect Ratio)</label>
+                      <select
+                        value={config.imageAspectRatio}
+                        onChange={(e) => setConfig({ ...config, imageAspectRatio: e.target.value })}
+                        className="w-full bg-slate-50/80 border border-violet-100/50 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500/20 focus:border-violet-300 shadow-inner"
+                      >
+                        <option value="16:9">16:9</option>
+                        <option value="9:16">9:16</option>
+                        <option value="1:1">1:1</option>
+                        <option value="4:3">4:3</option>
+                        <option value="3:4">3:4</option>
+                        <option value="auto">Auto</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-black text-slate-500 mb-1 ml-1 uppercase">图片分辨率分数 (Size)</label>
+                      <select
+                        value={config.imageSize}
+                        onChange={(e) => setConfig({ ...config, imageSize: e.target.value })}
+                        className="w-full bg-slate-50/80 border border-violet-100/50 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500/20 focus:border-violet-300 shadow-inner"
+                      >
+                        <option value="1K">1K</option>
+                        <option value="2K">2K</option>
+                        <option value="4K">4K</option>
+                      </select>
+                      <p className="text-[10px] text-slate-400 mt-1">注意：部分子模型限制最高2K</p>
+                    </div>
+                  </div>
+
+                  <div className={`p-6 rounded-3xl border transition-all ${config.imageProvider === 'dakka' ? 'border-amber-300 bg-amber-50/50' : 'border-slate-200 bg-slate-50'}`}>
+                    <h4 className="font-black text-slate-800 mb-4 flex items-center gap-2">Dakka 生图 API</h4>
+                    <div className="space-y-4">
+                      <div>
+                        <label className="block text-[10px] font-black text-slate-500 mb-1 ml-1 uppercase">API Key (Dakka)</label>
+                        <input
+                          type="password"
+                          value={config.imageDakkaApiKey}
+                          onChange={(e) => setConfig({ ...config, imageDakkaApiKey: e.target.value })}
+                          className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-black text-slate-500 mb-1 ml-1 uppercase">模型名称 (Sub-model)</label>
+                        <select
+                          value={config.imageDakkaModel}
+                          onChange={(e) => setConfig({ ...config, imageDakkaModel: e.target.value })}
+                          className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                        >
+                          <option value="nano-banana-pro">nano-banana-pro</option>
+                          <option value="nano-banana-2">nano-banana-2</option>
+                          <option value="nano-banana">nano-banana</option>
+                          <option value="nano-banana-fast">nano-banana-fast</option>
+                          <option value="nano-banana-pro-vt">nano-banana-pro-vt</option>
+                          <option value="nano-banana-pro-4k-vip">nano-banana-pro-4k-vip</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className={`p-6 rounded-3xl border transition-all ${config.imageProvider === 'yijia' ? 'border-amber-300 bg-amber-50/50' : 'border-slate-200 bg-slate-50'}`}>
+                    <h4 className="font-black text-slate-800 mb-4 flex items-center gap-2">Yijia (意佳) 生图 API</h4>
+                    <div className="space-y-4">
+                      <div>
+                        <label className="block text-[10px] font-black text-slate-500 mb-1 ml-1 uppercase">API Key (Yijia)</label>
+                        <input
+                          type="password"
+                          value={config.imageYijiaApiKey}
+                          onChange={(e) => setConfig({ ...config, imageYijiaApiKey: e.target.value })}
+                          className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-black text-slate-500 mb-1 ml-1 uppercase">模型名称 (Sub-model)</label>
+                        <select
+                          value={config.imageYijiaModel}
+                          onChange={(e) => setConfig({ ...config, imageYijiaModel: e.target.value })}
+                          className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/20"
+                        >
+                          <option value="nano_banana_pro">nano_banana_pro</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
 
@@ -1982,45 +2612,28 @@ export default function App() {
                       添加自定义风格
                     </button>
                   </div>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
                     {customStyles.map((style) => (
                       <div key={style.id} className="relative group">
                         <button
                           onClick={() => setNewProjectStyle(style.name)}
                           className={`
-                            w-full relative flex flex-col rounded-3xl overflow-hidden transition-all border-2
+                            w-full relative flex items-center justify-center p-4 rounded-2xl transition-all border-2
                             ${newProjectStyle === style.name 
-                              ? 'border-violet-500 ring-4 ring-violet-500/10' 
-                              : 'border-transparent hover:border-gray-200'}
+                              ? 'border-violet-500 bg-violet-500 text-white shadow-md shadow-violet-500/20' 
+                              : 'border-slate-100 bg-white text-slate-700 hover:border-violet-200 hover:bg-slate-50'}
                           `}
                         >
-                          <div className="aspect-[4/3] w-full overflow-hidden relative">
-                            <img 
-                              src={style.image} 
-                              alt={style.name}
-                              referrerPolicy="no-referrer"
-                              className={`w-full h-full object-cover transition-transform duration-500 ${newProjectStyle === style.name ? 'scale-110' : 'group-hover:scale-105'}`}
-                              onError={(e) => {
-                                (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=800&q=80';
-                              }}
-                            />
-                            <div className={`absolute inset-0 bg-black/20 transition-opacity ${newProjectStyle === style.name ? 'opacity-0' : 'group-hover:opacity-10'}`} />
-                          </div>
-                          <div className={`
-                            p-3 text-center text-xs font-black transition-colors
-                            ${newProjectStyle === style.name ? 'bg-violet-500 text-white' : 'bg-white text-gray-700'}
-                          `}>
-                            {style.name}
-                          </div>
+                          <span className="text-sm font-black truncate px-2">{style.name}</span>
                           {newProjectStyle === style.name && (
-                            <div className="absolute top-2 right-2 bg-white text-violet-600 rounded-full p-1 shadow-lg">
-                              <Check size={12} strokeWidth={4} />
+                            <div className="absolute top-1.5 right-1.5 bg-white text-violet-600 rounded-full p-0.5 shadow-sm">
+                              <Check size={10} strokeWidth={4} />
                             </div>
                           )}
                         </button>
                         
                         {/* Edit/Delete Actions */}
-                        <div className="absolute top-2 left-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <div className="absolute -top-2 -left-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-10">
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
@@ -2069,6 +2682,71 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* Project Delete Confirmation Modal */}
+      <AnimatePresence>
+        {projectToDelete && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-md"
+              onClick={() => {
+                setProjectToDelete(null);
+                setDeleteConfirmText('');
+              }}
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="bg-white/95 backdrop-blur-xl rounded-[40px] p-8 w-full max-w-md relative z-10 shadow-2xl border border-white/20"
+            >
+              <div className="w-16 h-16 bg-red-50 text-red-500 rounded-[24px] flex items-center justify-center mb-6 mx-auto">
+                <Trash2 size={32} />
+              </div>
+              
+              <h2 className="text-2xl font-black mb-2 text-slate-800 text-center">删除剧本</h2>
+              <p className="text-slate-500 mb-6 text-center font-medium">
+                此操作无法撤销。该剧本下的所有章节和资产将被永久删除。
+              </p>
+              
+              <div className="mb-8">
+                <label className="block text-sm font-bold text-slate-700 mb-2 text-center">
+                  请输入剧本名称 <span className="text-red-500 font-black">{projectToDelete.name}</span> 以确认
+                </label>
+                <input
+                  type="text"
+                  value={deleteConfirmText}
+                  onChange={(e) => setDeleteConfirmText(e.target.value)}
+                  placeholder={projectToDelete.name}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-red-500/20 focus:border-red-400 font-bold text-center"
+                />
+              </div>
+
+              <div className="flex gap-4">
+                <button
+                  onClick={() => {
+                    setProjectToDelete(null);
+                    setDeleteConfirmText('');
+                  }}
+                  className="flex-1 px-6 py-4 rounded-[24px] font-black text-slate-500 hover:bg-slate-100 transition-colors"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleConfirmDeleteProject}
+                  disabled={deleteConfirmText !== projectToDelete.name}
+                  className="flex-1 px-6 py-4 rounded-[24px] font-black bg-red-500 text-white hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-xl shadow-red-500/20 active:scale-95"
+                >
+                  确认删除
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Style Edit/Add Modal */}
       <AnimatePresence>
         {(isAddingStyle || editingStyle) && (
@@ -2104,8 +2782,9 @@ export default function App() {
                     className="w-full bg-slate-50/80 border border-violet-100/50 rounded-3xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-violet-500/20 focus:border-violet-300 font-bold shadow-inner"
                   />
                 </div>
+                {/* Optional Image */}
                 <div>
-                  <label className="block text-sm font-black text-gray-700 mb-2">封面图片 URL</label>
+                  <label className="block text-sm font-black text-gray-700 mb-2">封面图片 URL (可选)</label>
                   <div className="flex gap-2">
                     <div className="flex-1 relative">
                       <div className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400">
@@ -2147,7 +2826,7 @@ export default function App() {
                 </button>
                 <button
                   onClick={handleSaveStyle}
-                  disabled={!editStyleName.trim() || !editStyleImage.trim()}
+                  disabled={!editStyleName.trim()}
                   className="flex-1 px-4 py-3 rounded-3xl font-black bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white hover:opacity-90 disabled:opacity-50 transition-all shadow-lg shadow-violet-500/20 hover:-translate-y-0.5 border-none"
                 >
                   保存

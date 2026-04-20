@@ -24,6 +24,16 @@ export interface AppConfig {
   models: Record<ModelProvider, ModelSettings>;
   templates: Record<InstructionCategory, InstructionTemplate[]>;
   activeTemplateIds: Record<InstructionCategory, string>;
+  autoExtractAssets: boolean;
+  // Image Generation Settings
+  imageProvider: 'dakka' | 'yijia';
+  imageDakkaApiKey: string;
+  imageYijiaApiKey: string;
+  imageDakkaModel: string;
+  imageYijiaModel: string;
+  imageAspectRatio: string;
+  imageSize: string; // e.g. 1K, 2K, 4K
+  autoDownloadImages: boolean;
 }
 
 export interface Asset {
@@ -32,6 +42,8 @@ export interface Asset {
   type: 'character' | 'prop' | 'scene';
   prompt: string;
   createdAt: number;
+  imageUrl?: string;
+  imageStatus?: 'idle' | 'generating' | 'success' | 'error';
 }
 
 export interface Chapter {
@@ -58,7 +70,9 @@ export interface StyleOption {
 }
 
 export const STYLES: StyleOption[] = [
+  { id: 'korean-game-realism', name: '韩式游戏写实风', image: '' },
   { id: '3d-xianxia', name: '3D国漫仙侠', image: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=800&q=80' },
+
   { id: '3d-urban', name: '3D国漫都市', image: 'https://images.unsplash.com/photo-1449156003053-c30670b9883c?auto=format&fit=crop&w=800&q=80' },
   { id: '3d-fantasy', name: '3D玄幻大片', image: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?auto=format&fit=crop&w=800&q=80' },
   { id: 'cyberpunk', name: '赛博朋克未来', image: 'https://images.unsplash.com/photo-1605810230434-7631ac76ec81?auto=format&fit=crop&w=800&q=80' },
